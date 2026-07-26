@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "xangi-pets",
+  "version": "0.0.7",
+  "identifier": "dev.karaage.xangi-pets",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "pet",
+        "title": "xangi-pets",
+        "width": 280,
+        "height": 200,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false,
+        "fullscreen": false,
+        "x": 80,
+        "y": 80,
+        "acceptFirstMouse": true,
+        "hiddenTitle": true,
+        "titleBarStyle": "Transparent"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "resources/default-pets/xangi/pet.json": "resources/default-pets/xangi/pet.json",
+      "resources/default-pets/xangi/spritesheet.webp": "resources/default-pets/xangi/spritesheet.webp",
+      "../LICENSE": "LICENSE",
+      "THIRD_PARTY_LICENSES.html": "THIRD_PARTY_LICENSES.html"
+    },
+    "macOS": {
+      "signingIdentity": "-"
+    }
+  }
+}

@@ -1,0 +1,74 @@
+name: Release
+
+# Triggers:
+# - Push a `v*` tag (e.g. `v0.1.0`) → build the verified macOS Apple Silicon
+#   package and create a draft GitHub Release with the .dmg attached.
+# - workflow_dispatch → re-run on demand without bumping the tag.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish-tauri:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            src-tauri/target/
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 'lts/*'
+          cache: npm
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Run frontend tests
+        run: npm test
+
+      # Builds the Tauri app and (only when triggered by a `v*` tag push)
+      # uploads the bundles to a draft GitHub Release. workflow_dispatch and
+      # other branch-level runs build but skip release upload — so we can
+      # smoke-test the workflow on a branch without leaving stray drafts.
+      #
+      # `tagName: ''` is how tauri-action signals "build only, no release":
+      # the GitHub Actions expression returns the tag name on a tag push and
+      # an empty string otherwise.
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          releaseName: 'xangi-pets ${{ github.ref_name }}'
+          releaseBody: |
+            This release supports macOS on Apple Silicon.
+
+            See `docs/EVENTS.md` and the in-app help (`h` key) for usage.
+          releaseDraft: true
+          prerelease: false
+
+      - name: Upload macOS bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: xangi-pets-macos-arm64
+          path: src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,31 @@
+[package]
+name = "xangi-events-server"
+version = "0.0.6"
+edition = "2021"
+description = "Embedded HTTP event-bus for xangi-pets (axum, no Tauri deps)"
+license = "Apache-2.0"
+
+[lib]
+name = "xangi_events_server"
+path = "src/lib.rs"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "net"] }
+tower-http = { version = "0.5", features = ["cors"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+mime_guess = "2"
+# Pull-mode SSE client: subscribes to xangi's GET /api/events/stream and
+# feeds events into the same bus that POST /events used to. Default-features
+# off + rustls-tls keeps libssl/openssl out of the build.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest-eventsource = "0.6"
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
