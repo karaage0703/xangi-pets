@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    The configured xangi endpoint is commonly an explicit http://localhost,
+    LAN, or Tailscale URL. Rust's SSE/POST client can reach it, but WKWebView
+    is governed separately by App Transport Security. Limit the exception to
+    embedded web content instead of allowing arbitrary cleartext networking
+    for the entire application.
+  -->
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsArbitraryLoadsInWebContent</key>
+    <true/>
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+  </dict>
+</dict>
+</plist>

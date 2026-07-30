@@ -13,6 +13,10 @@ xangi用のデスクトップ常駐ペット。透明な最前面ウィンドウ
 - xangiの `idle / thinking / talking / error` に合わせたアニメーション
 - 複数会話の吹き出し表示と、長文の4秒ごとの自動ページ送り
 - ペットのクリックまたは `t` キーでxangiへメッセージ送信
+- メニューバー常駐と通常アプリメニュー。ペットを隠しても、再表示・話しかける・Web Chat・接続先変更へアクセス可能
+- Web Chatをxangi-pets内の通常ウィンドウで表示（必要なら既定ブラウザでも開ける）
+- xangiとの接続状態（接続中・接続済み・再接続中）と、内蔵サーバのポートを両方のメニューで確認
+- 任意で新規turnの完了・エラーをmacOS通知（初回起動では通知許可を要求しない）
 - ペットと吹き出しをそれぞれ5段階で拡大
 - Codex `hatch-pet` 互換スプライトと、公開用に制作した同梱ペット `xangi`
 - 動作確認済みのmacOS Apple Silicon向け配布バイナリ
@@ -25,6 +29,22 @@ xangi用のデスクトップ常駐ペット。透明な最前面ウィンドウ
 
 xangiが別マシンの場合は、LANまたはTailscaleから到達できるWeb Chat URLを指定する。あとから変更するにはペットへフォーカスして `x` キーを押す。
 
+## メニューバーと通常アプリメニュー
+
+起動中はメニューバーにxangi-petsが常駐する。同じ主要操作を、xangi-petsがアクティブなときの通常アプリメニューからも実行できる。メニューバーのアイコンがほかの常駐アプリに隠れた場合も、Dockからxangi-petsを選べば通常アプリメニューを使える。
+
+- ペットを表示 / 隠す
+- xangiに話しかける（ペットを表示してフォーカスした後、既存の入力モーダルを開く）
+- Web Chatをアプリで開く（設定済みのxangi URLを通常のTauriウィンドウに表示）
+- Web Chatをブラウザで開く
+- xangi URLを設定
+- 通知のON/OFF
+- ヘルプ、終了
+
+接続済み表示はSSE handshakeが成功した場合だけになる。xangiが停止すると再接続中へ変わり、復帰後は自動的に接続済みへ戻る。通知をONにした場合も、ON以後に開始したturnの完了またはエラーだけを1回通知し、再接続時の過去イベントは通知しない。ペットから最初に話しかけたときは、そのxangi-petsプロセス専用の新しいWebセッションを作る。同じ起動中の次のメッセージはそのセッションを継続し、既存のブラウザや別デバイスのWebセッションへ混ざらない。
+
+接続先は `http://` または `https://` のみ受け付け、URL内のuserinfoは拒否する。queryとfragmentは保存・表示・アプリ内表示・ブラウザ起動の前に除去する。macOS版はlocalhost・LAN・Tailscaleで一般的なHTTPのWeb ChatをWKWebViewへ表示できるよう、埋め込みWebコンテンツだけにApp Transport Securityの例外を適用する。アプリ内Web Chatはリモートコンテンツとして表示し、ペット側のTauri権限を付与しない。
+
 ## 設計
 
 - **生成**: 既存の Codex `hatch-pet` で作ったスプライトを流用（`~/.codex/pets/<name>/`）
@@ -36,7 +56,8 @@ xangiが別マシンの場合は、LANまたはTailscaleから到達できるWeb
 ```
 xangi (web-chat :18888) ──/api/events/stream (SSE)──▶ xangi-pets (Tauri)
                                                        ├─ pull client ─▶ axum bus
-                                                       └─ webview ─▶ Canvas + bubble
+                                                       ├─ pet webview ─▶ Canvas + bubble
+                                                       └─ Web Chat window ─▶ configured xangi URL
 ```
 
 xangi 側 URL は **起動時に prompt** で入力（`x` キーで再設定可）。env `XANGI_URL` でも初期値を渡せる。設定後は localStorage と Tauri 側 OnceLock の両方に保存され、再起動で自動再接続。
@@ -166,6 +187,7 @@ open -n -a /Applications/xangi-pets.app
 仕組み:
 
 - 内蔵 HTTP サーバの port は **7895 → 7896 → … と auto-shift**（`PORT_AUTOSHIFT_TRIES=10`）するので、port 衝突しない
+- 各プロセスのメニューバーtooltipと状態行に実際のbound portを表示するため、複数インスタンスを識別できる
 - localStorage キーは **bound port を namespace に使う**（例: `xangi-pets:7895:name` / `xangi-pets:7896:name`）。WKWebView は同 bundle の複数プロセス間で localStorage を共有するが、port namespace で衝突を回避
 - 既存ユーザの `xangi-pets:name` 等は legacy fallback として読み込まれる（破壊的変更なし）
 

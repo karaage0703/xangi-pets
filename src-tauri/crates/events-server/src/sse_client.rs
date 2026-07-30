@@ -26,6 +26,17 @@ use tokio::task::JoinHandle;
 
 use crate::http_server::{process_event, AppState};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PullConnectionState {
+    Connecting,
+    Connected,
+    Reconnecting,
+    Disconnected,
+}
+
+pub type ConnectionCallback = Arc<dyn Fn(PullConnectionState) + Send + Sync>;
+pub type EventCallback = Arc<dyn Fn(&Value) + Send + Sync>;
+
 /// Initial reconnect delay when the upstream stream errors out.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Max reconnect delay (exponential backoff capped here).
@@ -54,10 +65,31 @@ impl PullClientHandle {
 ///
 /// Reconnects with exponential backoff on stream error / server restart.
 pub fn spawn_pull_client(state: AppState, xangi_url: String) -> PullClientHandle {
+    spawn_pull_client_with_callbacks(
+        state,
+        xangi_url,
+        Arc::new(|_| {}),
+        Arc::new(|_| {}),
+    )
+}
+
+pub fn spawn_pull_client_with_callbacks(
+    state: AppState,
+    xangi_url: String,
+    on_connection: ConnectionCallback,
+    on_event: EventCallback,
+) -> PullClientHandle {
     let cancel = Arc::new(Notify::new());
     let cancel_for_task = cancel.clone();
     let task = tokio::spawn(async move {
-        run(state, xangi_url, cancel_for_task).await;
+        run(
+            state,
+            xangi_url,
+            cancel_for_task,
+            on_connection,
+            on_event,
+        )
+        .await;
     });
     PullClientHandle {
         cancel,
@@ -65,12 +97,24 @@ pub fn spawn_pull_client(state: AppState, xangi_url: String) -> PullClientHandle
     }
 }
 
-async fn run(state: AppState, xangi_url: String, cancel: Arc<Notify>) {
+async fn run(
+    state: AppState,
+    xangi_url: String,
+    cancel: Arc<Notify>,
+    on_connection: ConnectionCallback,
+    on_event: EventCallback,
+) {
     let mut backoff = INITIAL_BACKOFF;
+    on_connection(PullConnectionState::Connecting);
     loop {
         let cancelled = tokio::select! {
             _ = cancel.notified() => true,
-            outcome = run_once(&state, &xangi_url) => {
+            outcome = run_once(
+                &state,
+                &xangi_url,
+                on_connection.clone(),
+                on_event.clone(),
+            ) => {
                 match outcome {
                     Ok(()) => {
                         // Server closed the stream cleanly. Reset backoff and
@@ -88,8 +132,10 @@ async fn run(state: AppState, xangi_url: String, cancel: Arc<Notify>) {
             }
         };
         if cancelled {
+            on_connection(PullConnectionState::Disconnected);
             break;
         }
+        on_connection(PullConnectionState::Reconnecting);
         // Wait before reconnecting, but break out early if we get cancelled
         // mid-sleep.
         let cancelled_during_sleep = tokio::select! {
@@ -103,12 +149,18 @@ async fn run(state: AppState, xangi_url: String, cancel: Arc<Notify>) {
     }
 }
 
-async fn run_once(state: &AppState, xangi_url: &str) -> Result<(), String> {
+async fn run_once(
+    state: &AppState,
+    xangi_url: &str,
+    on_connection: ConnectionCallback,
+    on_event: EventCallback,
+) -> Result<(), String> {
     let mut es = EventSource::get(xangi_url);
     while let Some(ev) = es.next().await {
         match ev {
             Ok(Event::Open) => {
                 // SSE handshake completed.
+                on_connection(PullConnectionState::Connected);
             }
             Ok(Event::Message(msg)) => {
                 // xangi sends a single `event: ready` first with
@@ -125,10 +177,12 @@ async fn run_once(state: &AppState, xangi_url: &str) -> Result<(), String> {
                         continue;
                     }
                 };
-                if let Err(err) = process_event(state, raw) {
+                if let Err(err) = process_event(state, raw.clone()) {
                     // Validation rejection — log and keep going. We don't
                     // want one bad event to kill the whole stream.
                     eprintln!("xangi-events pull: rejected event: {err}");
+                } else {
+                    on_event(&raw);
                 }
             }
             Err(err) => {

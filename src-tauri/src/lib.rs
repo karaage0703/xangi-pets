@@ -1,12 +1,21 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
-use tauri::{Emitter, Manager};
+use tauri::menu::{
+    CheckMenuItem, CheckMenuItemBuilder, MenuBuilder, MenuItem, MenuItemBuilder,
+    PredefinedMenuItem, SubmenuBuilder,
+};
+use tauri::tray::TrayIconBuilder;
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, Wry};
+#[cfg(target_os = "macos")]
+use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_opener::OpenerExt;
 use xangi_events_server::{
-    make_state_with_extra_pet_dirs, post_pet_message, spawn_pull_client, AppState,
-    PullClientHandle,
+    create_pet_session, make_state_with_extra_pet_dirs, post_pet_message,
+    spawn_pull_client_with_callbacks, AppState, PetInboxError, PullClientHandle,
+    PullConnectionState,
 };
 
 const DEFAULT_PORT: u16 = 7895;
@@ -23,11 +32,25 @@ static SERVER_URL: OnceLock<String> = OnceLock::new();
 /// client (so we can stop+restart it when the user enters a new xangi URL).
 struct PullState {
     app: AppState,
+    app_handle: AppHandle,
     handle: Mutex<Option<PullClientHandle>>,
     current_url: Mutex<Option<String>>,
+    pet_session_id: Mutex<Option<String>>,
+    connection: Mutex<AppConnectionState>,
+    notifications_enabled: AtomicBool,
+    notification_turns: Mutex<HashSet<String>>,
+    generation: AtomicU64,
 }
 
 static PULL_STATE: OnceLock<Arc<PullState>> = OnceLock::new();
+
+struct AppMenuState {
+    status: MenuItem<Wry>,
+    port: MenuItem<Wry>,
+    notifications: CheckMenuItem<Wry>,
+}
+
+static APP_MENU_STATE: OnceLock<AppMenuState> = OnceLock::new();
 
 // Pet sprite size in *logical* (CSS) pixels — the unit used by the frontend
 // canvas. The hit-test polling loop multiplies these by the current scale
@@ -44,9 +67,44 @@ static PET_H: AtomicI32 = AtomicI32::new(104);
 // `set_bubble_active` Tauri command whenever the bubble stack is non-empty.
 static BUBBLE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppConnectionState {
+    NotConfigured,
+    Connecting,
+    Connected,
+    Reconnecting,
+    Disconnected,
+}
+
+impl AppConnectionState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "未設定",
+            Self::Connecting => "接続中",
+            Self::Connected => "接続済み",
+            Self::Reconnecting => "再接続中",
+            Self::Disconnected => "切断",
+        }
+    }
+
+    fn event_value(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "not-configured",
+            Self::Connecting => "connecting",
+            Self::Connected => "connected",
+            Self::Reconnecting => "reconnecting",
+            Self::Disconnected => "disconnected",
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(tauri_plugin_notification::init());
+
+    builder
         .setup(|app| {
             // Build a minimal macOS menu bar: App menu (About / Preferences /
             // Quit) + Help menu (Show Help). On Linux/Windows it shows up as
@@ -99,8 +157,7 @@ pub fn run() {
                     None
                 }
             };
-            let extra_pet_dirs: Vec<std::path::PathBuf> =
-                bundled_pet_dir.into_iter().collect();
+            let extra_pet_dirs: Vec<std::path::PathBuf> = bundled_pet_dir.into_iter().collect();
             let state = make_state_with_extra_pet_dirs(extra_pet_dirs);
             let pet_dirs = state.pet_dirs.clone();
 
@@ -109,12 +166,20 @@ pub fn run() {
             // this state to spawn_pull_client again).
             let pull_state = Arc::new(PullState {
                 app: state.clone(),
+                app_handle: app.handle().clone(),
                 handle: Mutex::new(None),
                 current_url: Mutex::new(None),
+                pet_session_id: Mutex::new(None),
+                connection: Mutex::new(AppConnectionState::NotConfigured),
+                notifications_enabled: AtomicBool::new(false),
+                notification_turns: Mutex::new(HashSet::new()),
+                generation: AtomicU64::new(0),
             });
             let _ = PULL_STATE.set(pull_state.clone());
+            install_tray(app.handle())?;
 
             let server_state = state.clone();
+            let tray_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let listener = match xangi_events_server::bind_with_autoshift(
                     addr,
@@ -131,6 +196,7 @@ pub fn run() {
                 let bound = listener.local_addr().unwrap_or(addr);
                 let url = format!("http://127.0.0.1:{}", bound.port());
                 let _ = SERVER_URL.set(url.clone());
+                refresh_tray(&tray_app);
 
                 println!("xangi-events listening on http://{bound}");
                 if bound.port() != addr.port() {
@@ -144,8 +210,7 @@ pub fn run() {
                 for d in pet_dirs.iter() {
                     println!("    - {}", d.display());
                 }
-                if let Err(err) =
-                    xangi_events_server::serve_listener(listener, server_state).await
+                if let Err(err) = xangi_events_server::serve_listener(listener, server_state).await
                 {
                     eprintln!("xangi-events server error: {err}");
                 }
@@ -156,9 +221,16 @@ pub fn run() {
             // webview onboarding UI. Frontend can override later via
             // `set_xangi_url`.
             if let Ok(url) = std::env::var("XANGI_URL") {
-                let url = url.trim().to_string();
-                if !url.is_empty() {
-                    start_pull_client(&pull_state, url);
+                match normalize_xangi_url(&url) {
+                    Ok(url) => {
+                        let pull_state = pull_state.clone();
+                        tauri::async_runtime::spawn(async move {
+                            start_pull_client(&pull_state, url);
+                        });
+                    }
+                    Err(err) => {
+                        eprintln!("xangi-pets: ignored unsafe XANGI_URL: {err}");
+                    }
                 }
             }
 
@@ -171,7 +243,11 @@ pub fn run() {
             set_xangi_url,
             get_xangi_url,
             clear_xangi_url,
-            send_pet_message
+            send_pet_message,
+            set_notifications_enabled,
+            get_notifications_enabled,
+            get_connection_status,
+            open_web_chat
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -222,13 +298,7 @@ fn set_pet_size(w: i32, h: i32) {
 /// inside `tauri::async_runtime` (which IS Tokio), so the inner spawn works.
 #[tauri::command]
 async fn set_xangi_url(url: String) -> Result<String, String> {
-    let trimmed = url.trim().trim_end_matches('/').to_string();
-    if trimmed.is_empty() {
-        return Err("xangi URL is empty".into());
-    }
-    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-        return Err(format!("xangi URL must start with http:// or https:// (got {trimmed})"));
-    }
+    let trimmed = normalize_xangi_url(&url)?;
     let pull_state = PULL_STATE.get().ok_or("pull state not initialised")?;
     start_pull_client(pull_state, trimmed.clone());
     Ok(trimmed)
@@ -266,9 +336,40 @@ async fn send_pet_message(text: String) -> Result<String, String> {
         .ok_or("xangi URL not set — open the URL prompt with `x` first")?;
     let token = std::env::var("XANGI_PET_INBOX_TOKEN").ok();
     let token_ref = token.as_deref().filter(|s| !s.is_empty());
-    let resp = post_pet_message(&base_url, &text, token_ref)
-        .await
-        .map_err(|e| e.to_string())?;
+    let session_id = pull_state
+        .pet_session_id
+        .lock()
+        .ok()
+        .and_then(|session_id| session_id.clone());
+    let session_id = match session_id {
+        Some(session_id) => session_id,
+        None => {
+            let session_id = create_pet_session(&base_url, token_ref)
+                .await
+                .map_err(|e| e.to_string())?;
+            if let Ok(mut current) = pull_state.pet_session_id.lock() {
+                *current = Some(session_id.clone());
+            }
+            session_id
+        }
+    };
+    let resp = match post_pet_message(&base_url, &text, token_ref, &session_id).await {
+        Ok(resp) => resp,
+        Err(PetInboxError::Rejected { status: 404, .. }) => {
+            // xangi may have restarted and forgotten an in-memory session.
+            // Create one replacement and retry this message exactly once.
+            let replacement = create_pet_session(&base_url, token_ref)
+                .await
+                .map_err(|e| e.to_string())?;
+            if let Ok(mut current) = pull_state.pet_session_id.lock() {
+                *current = Some(replacement.clone());
+            }
+            post_pet_message(&base_url, &text, token_ref, &replacement)
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        Err(err) => return Err(err.to_string()),
+    };
     Ok(resp.thread_id.unwrap_or_default())
 }
 
@@ -277,6 +378,8 @@ async fn send_pet_message(text: String) -> Result<String, String> {
 #[tauri::command]
 fn clear_xangi_url() {
     if let Some(pull_state) = PULL_STATE.get() {
+        pull_state.generation.fetch_add(1, Ordering::Relaxed);
+        set_connection_state(pull_state, AppConnectionState::NotConfigured);
         // Cancel the running task without blocking the command. The async
         // shutdown will run on the tokio pool.
         let pull_state = pull_state.clone();
@@ -285,8 +388,55 @@ fn clear_xangi_url() {
             if let Ok(mut url) = pull_state.current_url.lock() {
                 *url = None;
             }
+            if let Ok(mut session_id) = pull_state.pet_session_id.lock() {
+                *session_id = None;
+            }
+            refresh_tray(&pull_state.app_handle);
         });
     }
+}
+
+#[tauri::command]
+fn set_notifications_enabled(enabled: bool) {
+    if let Some(pull_state) = PULL_STATE.get() {
+        pull_state
+            .notifications_enabled
+            .store(enabled, Ordering::Relaxed);
+        if let Ok(mut turns) = pull_state.notification_turns.lock() {
+            turns.clear();
+        }
+        refresh_tray(&pull_state.app_handle);
+        let _ = pull_state
+            .app_handle
+            .emit("pet://notifications-changed", enabled);
+    }
+}
+
+#[tauri::command]
+fn get_notifications_enabled() -> bool {
+    PULL_STATE
+        .get()
+        .map(|state| state.notifications_enabled.load(Ordering::Relaxed))
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn get_connection_status() -> String {
+    PULL_STATE
+        .get()
+        .and_then(|state| {
+            state
+                .connection
+                .lock()
+                .ok()
+                .map(|value| value.event_value().into())
+        })
+        .unwrap_or_else(|| AppConnectionState::NotConfigured.event_value().into())
+}
+
+#[tauri::command]
+fn open_web_chat(app: AppHandle) -> Result<(), String> {
+    open_configured_web_chat(&app)
 }
 
 /// Append `/api/events/stream` to a base URL and start (or restart) the
@@ -296,13 +446,14 @@ fn clear_xangi_url() {
 fn start_pull_client(pull_state: &Arc<PullState>, base_url: String) {
     let stream_url = format!("{base_url}/api/events/stream");
     println!("xangi-events pull: subscribing to {stream_url}");
+    let generation = pull_state.generation.fetch_add(1, Ordering::Relaxed) + 1;
+    set_connection_state(pull_state, AppConnectionState::Connecting);
+    if let Ok(mut session_id) = pull_state.pet_session_id.lock() {
+        *session_id = None;
+    }
 
     // Stop the previous client (if any) before starting a new one.
-    let prev_handle = pull_state
-        .handle
-        .lock()
-        .ok()
-        .and_then(|mut g| g.take());
+    let prev_handle = pull_state.handle.lock().ok().and_then(|mut g| g.take());
     if let Some(prev) = prev_handle {
         let pull_state = pull_state.clone();
         tauri::async_runtime::spawn(async move {
@@ -312,24 +463,367 @@ fn start_pull_client(pull_state: &Arc<PullState>, base_url: String) {
         });
     }
 
-    let new_handle = spawn_pull_client(pull_state.app.clone(), stream_url);
+    let state_for_connection = pull_state.clone();
+    let on_connection = Arc::new(move |connection: PullConnectionState| {
+        if state_for_connection.generation.load(Ordering::Relaxed) != generation {
+            return;
+        }
+        let mapped = match connection {
+            PullConnectionState::Connecting => AppConnectionState::Connecting,
+            PullConnectionState::Connected => AppConnectionState::Connected,
+            PullConnectionState::Reconnecting => AppConnectionState::Reconnecting,
+            PullConnectionState::Disconnected => AppConnectionState::Disconnected,
+        };
+        set_connection_state(&state_for_connection, mapped);
+    });
+    let state_for_events = pull_state.clone();
+    let on_event = Arc::new(move |event: &serde_json::Value| {
+        if state_for_events.generation.load(Ordering::Relaxed) == generation {
+            handle_notification_event(&state_for_events, event);
+        }
+    });
+    let new_handle = spawn_pull_client_with_callbacks(
+        pull_state.app.clone(),
+        stream_url,
+        on_connection,
+        on_event,
+    );
     if let Ok(mut g) = pull_state.handle.lock() {
         *g = Some(new_handle);
     }
     if let Ok(mut g) = pull_state.current_url.lock() {
         *g = Some(base_url);
     }
+    refresh_tray(&pull_state.app_handle);
 }
 
 async fn stop_pull_client(pull_state: &Arc<PullState>) {
-    let prev = pull_state
-        .handle
-        .lock()
-        .ok()
-        .and_then(|mut g| g.take());
+    let prev = pull_state.handle.lock().ok().and_then(|mut g| g.take());
     if let Some(h) = prev {
         h.shutdown().await;
     }
+}
+
+fn normalize_xangi_url(input: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("xangi URL is empty".into());
+    }
+    let mut parsed = tauri::Url::parse(trimmed).map_err(|_| "xangi URL is invalid")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("xangi URL must use http:// or https://".into());
+    }
+    if parsed.host_str().is_none() {
+        return Err("xangi URL must include a host".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("xangi URL must not include user information".into());
+    }
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Ok(parsed.to_string().trim_end_matches('/').to_string())
+}
+
+fn set_connection_state(pull_state: &PullState, connection: AppConnectionState) {
+    if connection != AppConnectionState::Connected {
+        if let Ok(mut turns) = pull_state.notification_turns.lock() {
+            turns.clear();
+        }
+    }
+    if let Ok(mut current) = pull_state.connection.lock() {
+        *current = connection;
+    }
+    let _ = pull_state
+        .app_handle
+        .emit("pet://connection-status", connection.event_value());
+    refresh_tray(&pull_state.app_handle);
+}
+
+fn handle_notification_event(pull_state: &PullState, event: &serde_json::Value) {
+    if !pull_state.notifications_enabled.load(Ordering::Relaxed) {
+        return;
+    }
+    let should_notify = pull_state
+        .notification_turns
+        .lock()
+        .map(|mut turns| notification_transition(&mut turns, event))
+        .unwrap_or(false);
+    if !should_notify {
+        return;
+    }
+    let Some(event_type) = event.get("type").and_then(|value| value.as_str()) else {
+        return;
+    };
+    let (title, body) = if event_type == "agent.error" {
+        (
+            "xangiでエラー",
+            event
+                .get("message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("処理中にエラーが発生しました"),
+        )
+    } else {
+        (
+            "xangiの応答が完了",
+            event
+                .get("text")
+                .and_then(|value| value.as_str())
+                .unwrap_or("新しい応答があります"),
+        )
+    };
+    let body = truncate_notification(body, 120);
+    show_system_notification(&pull_state.app_handle, title, &body);
+}
+
+fn notification_transition(turns: &mut HashSet<String>, event: &serde_json::Value) -> bool {
+    let Some(event_type) = event.get("type").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    let Some(thread_id) = event.get("thread_id").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    let Some(turn_id) = event.get("turn_id").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    let key = format!("{thread_id}\u{0}{turn_id}");
+    match event_type {
+        "turn.started" => {
+            turns.insert(key);
+            false
+        }
+        "turn.complete" | "agent.error" => turns.remove(&key),
+        "turn.aborted" => {
+            turns.remove(&key);
+            false
+        }
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn show_system_notification(app_handle: &AppHandle, title: &str, body: &str) {
+    if let Err(err) = app_handle
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+    {
+        eprintln!("xangi-pets: notification failed: {err}");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn show_system_notification(_app_handle: &AppHandle, _title: &str, _body: &str) {}
+
+fn truncate_notification(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
+fn install_tray(app: &AppHandle) -> tauri::Result<()> {
+    let menu = build_tray_menu(app)?;
+    let mut builder = TrayIconBuilder::with_id("xangi-pets-tray")
+        .tooltip("xangi-pets")
+        .menu(&menu);
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    builder.build(app)?;
+    Ok(())
+}
+
+fn build_tray_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    let (connection, notifications_enabled) = PULL_STATE
+        .get()
+        .map(|state| {
+            (
+                state
+                    .connection
+                    .lock()
+                    .map(|value| *value)
+                    .unwrap_or(AppConnectionState::Disconnected),
+                state.notifications_enabled.load(Ordering::Relaxed),
+            )
+        })
+        .unwrap_or((AppConnectionState::NotConfigured, false));
+    let status = MenuItemBuilder::with_id("tray_status", format!("xangi: {}", connection.label()))
+        .enabled(false)
+        .build(app)?;
+    let port = MenuItemBuilder::with_id(
+        "tray_port",
+        format!(
+            "pet server: {}",
+            SERVER_URL
+                .get()
+                .and_then(|url| url.rsplit(':').next())
+                .map(str::to_owned)
+                .unwrap_or_else(|| "起動中".into())
+        ),
+    )
+    .enabled(false)
+    .build(app)?;
+    let show = MenuItemBuilder::with_id("tray_show", "ペットを表示").build(app)?;
+    let hide = MenuItemBuilder::with_id("tray_hide", "ペットを隠す").build(app)?;
+    let talk = MenuItemBuilder::with_id("tray_talk", "xangiに話しかける…").build(app)?;
+    let open_chat =
+        MenuItemBuilder::with_id("tray_open_chat", "Web Chatをアプリで開く").build(app)?;
+    let open_chat_browser =
+        MenuItemBuilder::with_id("tray_open_chat_browser", "Web Chatをブラウザで開く")
+            .build(app)?;
+    let preferences =
+        MenuItemBuilder::with_id("tray_preferences", "xangi URLを設定…").build(app)?;
+    let notifications = CheckMenuItemBuilder::with_id("tray_notifications", "通知")
+        .checked(notifications_enabled)
+        .build(app)?;
+    let help = MenuItemBuilder::with_id("tray_help", "ヘルプ").build(app)?;
+    let quit = MenuItemBuilder::with_id("tray_quit", "終了").build(app)?;
+    MenuBuilder::new(app)
+        .items(&[
+            &status,
+            &port,
+            &PredefinedMenuItem::separator(app)?,
+            &show,
+            &hide,
+            &talk,
+            &open_chat,
+            &open_chat_browser,
+            &preferences,
+            &notifications,
+            &PredefinedMenuItem::separator(app)?,
+            &help,
+            &quit,
+        ])
+        .build()
+}
+
+fn refresh_tray(app: &AppHandle) {
+    refresh_app_menu(app);
+    let Some(tray) = app.tray_by_id("xangi-pets-tray") else {
+        return;
+    };
+    match build_tray_menu(app) {
+        Ok(menu) => {
+            let _ = tray.set_menu(Some(menu));
+        }
+        Err(err) => eprintln!("xangi-pets: failed to refresh tray menu: {err}"),
+    }
+    if let Some(state) = PULL_STATE.get() {
+        let connection = state
+            .connection
+            .lock()
+            .map(|value| *value)
+            .unwrap_or(AppConnectionState::Disconnected);
+        let port = SERVER_URL
+            .get()
+            .and_then(|url| url.rsplit(':').next())
+            .unwrap_or("…");
+        let _ = tray.set_tooltip(Some(format!(
+            "xangi-pets · {} · port {port}",
+            connection.label()
+        )));
+    }
+}
+
+fn handle_control_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
+    match event.id().as_ref() {
+        "tray_show" | "menu_show" => show_pet_window(app),
+        "tray_hide" | "menu_hide" => {
+            if let Some(window) = app.get_webview_window("pet") {
+                let _ = window.hide();
+            }
+        }
+        "tray_talk" | "menu_talk" => {
+            show_pet_window(app);
+            let _ = app.emit("pet://talk", ());
+        }
+        "tray_open_chat" | "menu_open_chat" => {
+            if let Err(err) = open_configured_web_chat_window(app) {
+                eprintln!("xangi-pets: open in-app Web Chat failed: {err}");
+            }
+        }
+        "tray_open_chat_browser" | "menu_open_chat_browser" => {
+            if let Err(err) = open_configured_web_chat(app) {
+                eprintln!("xangi-pets: open Web Chat in browser failed: {err}");
+            }
+        }
+        "tray_preferences" | "menu_prefs" => {
+            show_pet_window(app);
+            let _ = app.emit("pet://set-xangi-url", ());
+        }
+        "tray_notifications" | "menu_notifications" => {
+            let enabled = PULL_STATE
+                .get()
+                .map(|state| !state.notifications_enabled.load(Ordering::Relaxed))
+                .unwrap_or(false);
+            set_notifications_enabled(enabled);
+        }
+        "tray_help" | "menu_help" | "menu_about" => {
+            show_pet_window(app);
+            let _ = app.emit("pet://show-help", ());
+        }
+        "tray_quit" => app.exit(0),
+        _ => {}
+    }
+}
+
+fn show_pet_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("pet") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn open_configured_web_chat(app: &AppHandle) -> Result<(), String> {
+    let url = configured_xangi_url()?;
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|err| err.to_string())
+}
+
+fn configured_xangi_url() -> Result<String, String> {
+    PULL_STATE
+        .get()
+        .and_then(|state| {
+            state
+                .current_url
+                .lock()
+                .ok()
+                .and_then(|value| value.clone())
+        })
+        .ok_or_else(|| "xangi URL is not configured".into())
+}
+
+fn open_configured_web_chat_window(app: &AppHandle) -> Result<(), String> {
+    let url = tauri::Url::parse(&configured_xangi_url()?)
+        .map_err(|_| "configured xangi URL is invalid")?;
+
+    if let Some(window) = app.get_webview_window("web-chat") {
+        let should_navigate = window.url().map(|current| current != url).unwrap_or(true);
+        if should_navigate {
+            window.navigate(url).map_err(|err| err.to_string())?;
+        }
+        let _ = window.unminimize();
+        window.show().map_err(|err| err.to_string())?;
+        window.set_focus().map_err(|err| err.to_string())?;
+        return Ok(());
+    }
+
+    WebviewWindowBuilder::new(app, "web-chat", WebviewUrl::External(url))
+        .title("xangi Web Chat")
+        .inner_size(1100.0, 760.0)
+        .min_inner_size(720.0, 480.0)
+        .resizable(true)
+        .center()
+        .build()
+        .map(|_| ())
+        .map_err(|err| err.to_string())
 }
 
 /// Background task: 50ms tick that toggles set_ignore_cursor_events based on
@@ -359,15 +853,33 @@ fn spawn_hit_polling(window: tauri::WebviewWindow) {
     });
 }
 
-/// Build the macOS menu bar and wire up menu events. On macOS the first
-/// submenu becomes the application menu automatically; we put About /
-/// Preferences / Quit there. A separate "Help" submenu hosts the
-/// keybindings overlay trigger so users who don't know the `h` key can find
-/// it from the menu bar.
+/// Build the application menu and wire up the same controls that are exposed
+/// by the tray. On macOS the first submenu becomes the application menu
+/// automatically. The normal Edit menu remains present because WKWebView
+/// clipboard shortcuts depend on those predefined items.
 fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
     let about = MenuItemBuilder::with_id("menu_about", "About xangi-pets").build(app)?;
+    let status = MenuItemBuilder::with_id("menu_status", "xangi: 未設定")
+        .enabled(false)
+        .build(app)?;
+    let port = MenuItemBuilder::with_id("menu_port", "pet server: 起動中")
+        .enabled(false)
+        .build(app)?;
+    let show = MenuItemBuilder::with_id("menu_show", "ペットを表示").build(app)?;
+    let hide = MenuItemBuilder::with_id("menu_hide", "ペットを隠す").build(app)?;
+    let talk = MenuItemBuilder::with_id("menu_talk", "xangiに話しかける…")
+        .accelerator("CmdOrCtrl+T")
+        .build(app)?;
+    let open_chat =
+        MenuItemBuilder::with_id("menu_open_chat", "Web Chatをアプリで開く").build(app)?;
+    let open_chat_browser =
+        MenuItemBuilder::with_id("menu_open_chat_browser", "Web Chatをブラウザで開く")
+            .build(app)?;
     let prefs = MenuItemBuilder::with_id("menu_prefs", "Preferences (xangi URL)…")
         .accelerator("CmdOrCtrl+,")
+        .build(app)?;
+    let notifications = CheckMenuItemBuilder::with_id("menu_notifications", "通知")
+        .checked(false)
         .build(app)?;
     let help = MenuItemBuilder::with_id("menu_help", "Show Help")
         .accelerator("CmdOrCtrl+/")
@@ -378,7 +890,16 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
     let app_submenu = SubmenuBuilder::new(app, "xangi-pets")
         .item(&about)
         .item(&PredefinedMenuItem::separator(app)?)
+        .item(&status)
+        .item(&port)
+        .item(&PredefinedMenuItem::separator(app)?)
+        .item(&show)
+        .item(&hide)
+        .item(&talk)
+        .item(&open_chat)
+        .item(&open_chat_browser)
         .item(&prefs)
+        .item(&notifications)
         .item(&PredefinedMenuItem::separator(app)?)
         .item(&PredefinedMenuItem::quit(app, None)?)
         .build()?;
@@ -401,26 +922,52 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
         .items(&[&app_submenu, &edit_submenu, &help_submenu])
         .build()?;
     app.set_menu(menu)?;
+    let _ = APP_MENU_STATE.set(AppMenuState {
+        status,
+        port,
+        notifications,
+    });
 
     app.on_menu_event(|app, event| {
-        // Frontend listens for `pet://show-help` and `pet://set-xangi-url`
-        // (see src/main.js — same handlers used for the `h` and `x` keys).
-        // About reuses the help overlay because that's where the version /
-        // current state / GitHub link live; building a separate About panel
-        // would just duplicate that.
-        let id = event.id().as_ref();
-        let event_name = match id {
-            "menu_about" => "pet://show-help",
-            "menu_prefs" => "pet://set-xangi-url",
-            "menu_help" => "pet://show-help",
-            _ => return,
-        };
-        if let Err(err) = app.emit(event_name, ()) {
-            eprintln!("xangi-pets: emit {event_name} failed: {err}");
-        }
+        handle_control_menu_event(app, event);
     });
 
     Ok(())
+}
+
+fn refresh_app_menu(_app: &AppHandle) {
+    let Some(menu) = APP_MENU_STATE.get() else {
+        return;
+    };
+    let (connection, notifications_enabled) = PULL_STATE
+        .get()
+        .map(|state| {
+            (
+                state
+                    .connection
+                    .lock()
+                    .map(|value| *value)
+                    .unwrap_or(AppConnectionState::Disconnected),
+                state.notifications_enabled.load(Ordering::Relaxed),
+            )
+        })
+        .unwrap_or((AppConnectionState::NotConfigured, false));
+    let port = SERVER_URL
+        .get()
+        .and_then(|url| url.rsplit(':').next())
+        .unwrap_or("起動中");
+    if let Err(err) = menu
+        .status
+        .set_text(format!("xangi: {}", connection.label()))
+    {
+        eprintln!("xangi-pets: failed to refresh app menu status: {err}");
+    }
+    if let Err(err) = menu.port.set_text(format!("pet server: {port}")) {
+        eprintln!("xangi-pets: failed to refresh app menu port: {err}");
+    }
+    if let Err(err) = menu.notifications.set_checked(notifications_enabled) {
+        eprintln!("xangi-pets: failed to refresh app menu notifications: {err}");
+    }
 }
 
 /// Returns true when the cursor is *outside* the pet sprite rectangle
@@ -454,4 +1001,87 @@ fn cursor_outside_pet(window: &tauri::WebviewWindow) -> Result<bool, ()> {
     let cy = cursor.y as i32;
     let inside = cx >= x_min && cx <= x_max && cy >= y_min && cy <= y_max;
     Ok(!inside)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_xangi_url, notification_transition, truncate_notification};
+    use serde_json::json;
+    use std::collections::HashSet;
+
+    #[test]
+    fn xangi_url_accepts_http_and_strips_query_and_fragment() {
+        assert_eq!(
+            normalize_xangi_url(" https://pet.example.test:8443/chat/?token=secret#part ").unwrap(),
+            "https://pet.example.test:8443/chat"
+        );
+        assert_eq!(
+            normalize_xangi_url("http://127.0.0.1:18888/").unwrap(),
+            "http://127.0.0.1:18888"
+        );
+    }
+
+    #[test]
+    fn xangi_url_rejects_unsafe_schemes_and_userinfo() {
+        assert!(normalize_xangi_url("file:///tmp/xangi").is_err());
+        assert!(normalize_xangi_url("https://user:pass@example.test").is_err());
+        assert!(normalize_xangi_url("not-a-url").is_err());
+    }
+
+    #[test]
+    fn notifications_only_fire_once_for_observed_turns() {
+        let mut turns = HashSet::new();
+        let complete = json!({
+            "type": "turn.complete",
+            "thread_id": "discord:1",
+            "turn_id": "turn-1",
+            "text": "done"
+        });
+        assert!(!notification_transition(&mut turns, &complete));
+        assert!(!notification_transition(
+            &mut turns,
+            &json!({
+                "type": "turn.started",
+                "thread_id": "discord:1",
+                "turn_id": "turn-1"
+            })
+        ));
+        assert!(notification_transition(&mut turns, &complete));
+        assert!(!notification_transition(&mut turns, &complete));
+    }
+
+    #[test]
+    fn aborted_turns_never_notify_and_error_turns_notify_once() {
+        let mut turns = HashSet::new();
+        let start = json!({
+            "type": "turn.started",
+            "thread_id": "web:1",
+            "turn_id": "turn-2"
+        });
+        assert!(!notification_transition(&mut turns, &start));
+        assert!(!notification_transition(
+            &mut turns,
+            &json!({
+                "type": "turn.aborted",
+                "thread_id": "web:1",
+                "turn_id": "turn-2"
+            })
+        ));
+        assert!(!notification_transition(&mut turns, &start));
+        assert!(notification_transition(
+            &mut turns,
+            &json!({
+                "type": "agent.error",
+                "thread_id": "web:1",
+                "turn_id": "turn-2",
+                "message": "boom"
+            })
+        ));
+    }
+
+    #[test]
+    fn notification_body_is_unicode_safe() {
+        assert_eq!(truncate_notification("あいう", 2), "あい…");
+        assert_eq!(truncate_notification("あいう", 3), "あいう");
+    }
 }

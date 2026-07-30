@@ -73,6 +73,12 @@ cancel：
 Pet は xangi の `GET /api/events/stream` (SSE) を購読する。詳細は
 [xangiの `docs/events.md`](https://github.com/karaage0703/xangi/blob/main/docs/events.md) を参照。
 
+Tauri側はSSE handshake成功時だけ接続済みとする。stream切断または接続エラー後は再接続中とし、指数backoffで自動再接続する。
+
+macOS通知を有効にした場合は、通知有効後かつ現在の接続中に `turn.started` を観測したturnだけを追跡する。そのturnの `turn.complete` または `agent.error` を最初に受信したときだけ通知する。再接続時に追跡中turnを破棄するため、過去イベントや終端イベント単独では通知しない。`turn.aborted` も通知しない。
+
+ペットからの送信では、xangi-petsの各プロセスが最初の送信時に `POST /api/sessions` で専用Webセッションを作り、そのIDを `POST /api/pet/inbox` の `appSessionId` に必ず指定する。同じ起動中はそのセッションを継続し、xangi再起動などでセッションが見つからない場合だけ新規作成して1回再送する。`appSessionId`省略時に最新Webセッションを再利用するxangiの後方互換動作には依存しない。
+
 ### `GET /api/pet/bubbles` (SSE)
 
 ペット UI 向けの **集約済み** ストリーム。クライアントは event 解釈不要で描画できる。
@@ -105,3 +111,4 @@ Pet は xangi の `GET /api/events/stream` (SSE) を購読する。詳細は
 - イベントは順序保証なし。送信側が時系列で投げる責任を負う
 - 失敗時の再送なし。Pet 表示は best-effort
 - 認証なし。Tailscale 内 / localhost 想定
+- 接続先URLは `http` / `https` のみ。userinfoを拒否し、query / fragmentを除去してbase URLとして扱う

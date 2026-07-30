@@ -5,6 +5,8 @@
 // app still works for local dev or first launch before the server is set up.
 
 import { bubblePageLayout, makeBubbleUI, subscribeBubbles } from './lib/bubble.js';
+import { makeClickGateController } from './lib/click-gate.js';
+import { fitWindowSize } from './lib/window-layout.js';
 
 const CELL_W = 192;
 const CELL_H = 208;
@@ -323,6 +325,12 @@ async function applyWindowSize(petScale, bubbleScale) {
   } catch {
     // browser mode — no-op
   }
+  await resizeWindowBottomCenter(w, h);
+}
+
+// Resize without moving the pet: the stage is pinned to the bottom-center, so
+// shifting the window by the inverse size delta keeps that point stationary.
+async function resizeWindowBottomCenter(w, h) {
   try {
     const w_api = await import('@tauri-apps/api/window');
     const dpi = await import('@tauri-apps/api/dpi');
@@ -330,23 +338,36 @@ async function applyWindowSize(petScale, bubbleScale) {
     const sf = await win.scaleFactor();
     const oldSize = await win.outerSize();
     const oldPos = await win.outerPosition();
+    // outerSize/outerPosition are physical pixels; convert desired dimensions
+    // before deciding whether a platform resize is needed.
+    const newWPhys = Math.round(w * sf);
+    const newHPhys = Math.round(h * sf);
+    const dyPhys = newHPhys - oldSize.height;
+    const dxPhys = newWPhys - oldSize.width;
+    if (dyPhys === 0 && dxPhys === 0) return;
     await win.setSize(new dpi.LogicalSize(w, h));
-    // outerSize/outerPosition are in physical pixels; convert deltas.
-    const newW_phys = Math.round(w * sf);
-    const newH_phys = Math.round(h * sf);
-    const dyPhys = newH_phys - oldSize.height;
-    const dxPhys = newW_phys - oldSize.width;
-    if (dyPhys !== 0 || dxPhys !== 0) {
-      await win.setPosition(
-        new dpi.PhysicalPosition(
-          oldPos.x - Math.round(dxPhys / 2),
-          oldPos.y - dyPhys,
-        ),
-      );
-    }
+    await win.setPosition(
+      new dpi.PhysicalPosition(
+        oldPos.x - Math.round(dxPhys / 2),
+        oldPos.y - dyPhys,
+      ),
+    );
   } catch {
     // browser dev mode — nothing to resize.
   }
+}
+
+// The scale-derived dimensions are only a minimum: thread labels and multiple
+// bubbles can make the rendered stack taller. Measure the complete stage so
+// the transparent Tauri window never clips its top edge.
+async function fitWindowToStage(stage, petScale, bubbleScale) {
+  if (!stage) return;
+  const measured = stage.getBoundingClientRect();
+  const size = fitWindowSize(
+    computeWindowSize(petScale, bubbleScale),
+    measured,
+  );
+  await resizeWindowBottomCenter(size.w, size.h);
 }
 
 async function loadFromServer(serverUrl, name) {
@@ -411,6 +432,8 @@ const helpState = {
   serverUrl: '',
   xangiUrl: null,
   petName: null,
+  connection: 'not-configured',
+  notificationsEnabled: false,
 };
 
 function isHelpOpen() {
@@ -497,6 +520,19 @@ function renderHelpState() {
       helpState.xangiUrl ? 'help-ok' : 'help-warn',
       '未設定（x キーで入力）',
     ),
+    helpRow(
+      '接続',
+      {
+        'not-configured': '未設定',
+        connecting: '接続中',
+        connected: '接続済み',
+        reconnecting: '再接続中',
+        disconnected: '切断',
+      }[helpState.connection] ?? helpState.connection,
+      helpState.connection === 'connected' ? 'help-ok' : 'help-warn',
+      '未設定',
+    ),
+    helpRow('通知', helpState.notificationsEnabled ? 'ON' : 'OFF', '', 'OFF'),
     helpRow('ペット', helpState.petName, '', '未選択'),
     helpRow('サーバ', helpState.serverUrl || '', '', '-'),
   ];
@@ -1061,20 +1097,12 @@ async function notifyBubbleActive(active) {
 // popModalClickGate() on close; while the depth is positive the entire
 // window receives clicks (we reuse Rust's `set_bubble_active` flag because
 // it has the same semantics: "accept clicks anywhere right now").
-let modalClickGateDepth = 0;
+const clickGate = makeClickGateController(notifyBubbleActive);
 async function pushModalClickGate() {
-  modalClickGateDepth += 1;
-  if (modalClickGateDepth === 1) {
-    await notifyBubbleActive(true);
-  }
+  await clickGate.pushModal();
 }
 async function popModalClickGate() {
-  modalClickGateDepth = Math.max(0, modalClickGateDepth - 1);
-  if (modalClickGateDepth === 0) {
-    // The bubble UI's onCountChange will flip this back on if a real bubble
-    // is currently visible; we just need to stop forcing it.
-    await notifyBubbleActive(false);
-  }
+  await clickGate.popModal();
 }
 
 function subscribeState(serverUrl, renderer) {
@@ -1104,22 +1132,26 @@ async function main() {
   const serverUrl = await resolveServerUrl();
   console.info(`xangi-pets: using server ${serverUrl}`);
 
-  // Ensure the Rust pull client is subscribed to a xangi instance. If the
-  // user cancels the prompt the pet still starts (sprite + keybindings) so
-  // they can press `x` to enter a URL later.
-  const xangiUrl = await ensureXangiUrl();
-  if (xangiUrl) {
-    console.info(`xangi-pets: subscribing to xangi at ${xangiUrl}/api/events/stream`);
-  } else {
-    console.warn('xangi-pets: no xangi URL configured — bubbles disabled. Press `x` to set.');
-  }
-
   // Now that we know which port we're bound to, derive a per-instance
   // localStorage namespace. Two `open -n` instances will have different
   // ports and thus separate pet/bubble-scale settings; a single instance
   // still inherits the legacy unprefixed values via readStorage's fallback.
   storageNamespace = deriveNamespace(serverUrl);
   console.info(`xangi-pets: storage namespace = ${storageNamespace || '(none)'}`);
+  const notificationsEnabled = readStorage('notifications') === '1';
+  await tauriInvoke('set_notifications_enabled', { enabled: notificationsEnabled }).catch((err) => {
+    console.warn('xangi-pets: notification preference could not be applied', err);
+  });
+
+  // Subscribe only after restoring the notification preference. That closes
+  // the startup race where a new turn could begin between the SSE handshake
+  // and applying a persisted "notifications on" setting.
+  const xangiUrl = await ensureXangiUrl();
+  if (xangiUrl) {
+    console.info(`xangi-pets: subscribing to xangi at ${xangiUrl}/api/events/stream`);
+  } else {
+    console.warn('xangi-pets: no xangi URL configured — bubbles disabled. Press `x` to set.');
+  }
 
   // Sprite scale and bubble scale are mutable at runtime via the `p` and `b`
   // keys, so keep them in `let` bindings the keydown handler can mutate.
@@ -1169,22 +1201,40 @@ async function main() {
 
   subscribeState(serverUrl, renderer);
   startWandering(renderer);
+  const stage = document.getElementById('stage');
+  let stageFitScheduled = false;
+  function scheduleStageWindowFit() {
+    if (!stage || stageFitScheduled) return;
+    stageFitScheduled = true;
+    requestAnimationFrame(() => {
+      stageFitScheduled = false;
+      void fitWindowToStage(stage, spriteScale, bubbleScale);
+    });
+  }
   const bubbleUi = makeBubbleUI({
     root: document.getElementById('bubbles'),
-    // Cap at 2 so bubbles always fit in the fixed-height window without
-    // clipping out the top. The pet stays anchored at the bottom; older
-    // bubbles get evicted when a 3rd arrives.
+    // Keep the stack compact: older bubbles are evicted when a 3rd arrives.
+    // The stage fitter below handles the rendered height of the remaining
+    // bubbles, including thread labels and streamed text.
     maxBubbles: 2,
     onCountChange: (count) => {
       // Tell Rust whether at least one bubble is on screen. Rust uses this
       // to decide whether the whole window should accept clicks (so the user
       // can dismiss bubbles) or only the pet sprite rectangle.
-      notifyBubbleActive(count > 0);
+      void clickGate.setBubbleCount(count);
+      scheduleStageWindowFit();
     },
   });
 
   subscribeBubbles(serverUrl, bubbleUi);
   window.__bubble = bubbleUi;
+
+  // Bubble text grows while SSE deltas stream in, and dismiss/eviction shrinks
+  // the stack. Follow the rendered stage in both directions.
+  if (typeof ResizeObserver !== 'undefined' && stage) {
+    new ResizeObserver(scheduleStageWindowFit).observe(stage);
+  }
+  scheduleStageWindowFit();
 
   // -webkit-app-region: drag does not work on Tauri's frameless macOS window;
   // call startDragging() from mousedown instead. Attach to the canvas only,
@@ -1226,6 +1276,7 @@ async function main() {
     serverUrl,
     petScale: spriteScale,
     bubbleScale,
+    notificationsEnabled: readStorage('notifications') === '1',
   });
 
   // Seed the help-overlay state immediately so a `pet://show-help` event
@@ -1240,6 +1291,19 @@ async function main() {
   await tauriListen('pet://set-xangi-url', async () => {
     await runSetXangiUrlPrompt(bubbleUi);
   });
+  await tauriListen('pet://talk', async () => {
+    await runPetMessagePrompt(bubbleUi);
+  });
+  await tauriListen('pet://connection-status', ({ payload }) => {
+    updateHelpState({ connection: String(payload ?? 'disconnected') });
+  });
+  await tauriListen('pet://notifications-changed', ({ payload }) => {
+    const enabled = payload === true;
+    writeStorage('notifications', enabled ? '1' : '0');
+    updateHelpState({ notificationsEnabled: enabled });
+  });
+  const connection = await tauriInvoke('get_connection_status').catch(() => 'not-configured');
+  updateHelpState({ connection: String(connection ?? 'not-configured') });
   await tauriListen('pet://reset-pet', async () => {
     let chosen;
     try {

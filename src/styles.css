@@ -53,8 +53,7 @@ canvas#pet {
 .bubble {
   position: relative;
   /* All sizes scale with --bubble-scale (set on body via main.js). The
-     window itself is resized in lock-step (applyBubbleScale) so the bubble
-     stack still fits when scale > 1. */
+     window follows the rendered stage so scaled or stacked bubbles fit. */
   max-width: calc(240px * var(--bubble-scale, 1));
   min-width: calc(60px * var(--bubble-scale, 1));
   padding: calc(6px * var(--bubble-scale, 1)) calc(10px * var(--bubble-scale, 1));
