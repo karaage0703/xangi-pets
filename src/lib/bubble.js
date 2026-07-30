@@ -71,18 +71,19 @@ export function makeBubbleUI({ root, maxBubbles = DEFAULT_MAX, onCountChange } =
   let lastNotifiedCount = 0;
   function notifyCount() {
     if (typeof onCountChange !== 'function') return;
-    if (bubbles.length === lastNotifiedCount) return;
-    lastNotifiedCount = bubbles.length;
+    const count = bubbles.length + (previewEl ? 1 : 0);
+    if (count === lastNotifiedCount) return;
+    lastNotifiedCount = count;
     try {
-      onCountChange(bubbles.length);
+      onCountChange(count);
     } catch (err) {
       console.warn('xangi-pets: onCountChange threw', err);
     }
   }
 
   // Preview bubble used by the size-cycling key handlers (`b` / `p`). It's a
-  // separate DOM node from the real bubble stack so it never enters `bubbles[]`
-  // and never affects click-through (notifyCount stays based on real bubbles).
+  // separate DOM node from the real bubble stack, but still counts as visible
+  // so Rust lets its click reach the DOM.
   let previewEl = null;
   let previewTimer = null;
   function showPreview(text) {
@@ -101,12 +102,15 @@ export function makeBubbleUI({ root, maxBubbles = DEFAULT_MAX, onCountChange } =
       // Newest bubble sits at the bottom (closest to pet). Insert preview at
       // the bottom too so users see it where real bubbles would appear.
       root.appendChild(previewEl);
+      previewEl.addEventListener('click', () => clearPreview());
+      notifyCount();
     }
     previewEl._textEl.textContent = text;
     if (previewTimer) clearTimeout(previewTimer);
     previewTimer = setTimeout(() => clearPreview(), PREVIEW_AUTO_HIDE_MS);
   }
-  function clearPreview() {
+  function clearPreview(shouldNotify = true) {
+    const hadPreview = Boolean(previewEl);
     if (previewTimer) {
       clearTimeout(previewTimer);
       previewTimer = null;
@@ -115,12 +119,15 @@ export function makeBubbleUI({ root, maxBubbles = DEFAULT_MAX, onCountChange } =
       if (previewEl.parentNode) previewEl.parentNode.removeChild(previewEl);
       previewEl = null;
     }
+    if (hadPreview && shouldNotify) notifyCount();
   }
 
   // Ordered oldest -> newest. Each entry tracks a single (thread, turn) bubble
   // and the DOM nodes that render it. We render newest-at-bottom by inserting
   // newer bubbles last and relying on CSS flex column ordering.
   const bubbles = []; // { id, thread_id, turn_id, text, status, el, textEl, threadEl }
+  const dismissedTurnIds = new Set();
+  const maxDismissedTurnIds = 128;
 
   function bubbleId(thread_id, turn_id) {
     return `${thread_id}\u0000${turn_id}`;
@@ -212,7 +219,7 @@ export function makeBubbleUI({ root, maxBubbles = DEFAULT_MAX, onCountChange } =
     });
   }
 
-  function dismiss(b) {
+  function removeBubble(b) {
     const idx = bubbles.indexOf(b);
     if (idx < 0) return;
     clearPagingTimer(b);
@@ -220,6 +227,14 @@ export function makeBubbleUI({ root, maxBubbles = DEFAULT_MAX, onCountChange } =
     if (b.el.parentNode) b.el.parentNode.removeChild(b.el);
     renderThreadTags();
     notifyCount();
+  }
+
+  function dismiss(b) {
+    dismissedTurnIds.add(b.id);
+    if (dismissedTurnIds.size > maxDismissedTurnIds) {
+      dismissedTurnIds.delete(dismissedTurnIds.values().next().value);
+    }
+    removeBubble(b);
   }
 
   function createBubble(thread_id, turn_id) {
@@ -272,7 +287,9 @@ export function makeBubbleUI({ root, maxBubbles = DEFAULT_MAX, onCountChange } =
 
   function pushBubble(entry) {
     // A real bubble arrived — drop the preview so it doesn't sit alongside.
-    clearPreview();
+    // Suppress its intermediate count update: this function sends the final
+    // real-bubble count after inserting the new entry.
+    clearPreview(false);
     // Same thread = same bubble slot. Replace any prior bubble for this
     // thread (closed last_message, error, or in-flight stale turn) so the
     // pet only ever shows one bubble per thread.
@@ -319,6 +336,12 @@ export function makeBubbleUI({ root, maxBubbles = DEFAULT_MAX, onCountChange } =
 
   function handle(ev) {
     if (!ev || typeof ev.type !== 'string') return;
+    if (
+      ev.type.startsWith('bubble.') &&
+      dismissedTurnIds.has(bubbleId(ev.thread_id, ev.turn_id))
+    ) {
+      return;
+    }
     switch (ev.type) {
       case 'bubble.snapshot': {
         // A bubble that was already open before we connected. Treat it like
@@ -401,7 +424,7 @@ export function makeBubbleUI({ root, maxBubbles = DEFAULT_MAX, onCountChange } =
         status,
       })),
     _dismissAll: () => {
-      while (bubbles.length) dismiss(bubbles[0]);
+      while (bubbles.length) removeBubble(bubbles[0]);
     },
   };
 }

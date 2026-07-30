@@ -164,6 +164,23 @@ async function run() {
   // 5. Dismiss the bubble → timer cleared.
   bBubble.dispatchEvent('click');
   assert(activeIntervals() === 0, 'dismiss: paging timer cleared');
+  ui.handle({ type: 'bubble.delta', thread_id: 'B', turn_id: 'u2', text: 'late' });
+  ui.handle({
+    type: 'bubble.close',
+    thread_id: 'B',
+    turn_id: 'u2',
+    last_message: `${longBase}late`,
+  });
+  assert(
+    !ui._state().some((b) => b.thread_id === 'B' && b.turn_id === 'u2'),
+    'dismiss: later events for the same turn do not recreate the bubble',
+  );
+  ui.handle({ type: 'bubble.open', thread_id: 'B', turn_id: 'u3' });
+  assert(
+    ui._state().some((b) => b.thread_id === 'B' && b.turn_id === 'u3'),
+    'dismiss: a new turn on the same thread still appears',
+  );
+  ui._dismissAll();
 
   // 6. Replace via same-thread new turn → old timer cleared.
   ui.handle({ type: 'bubble.open', thread_id: 'C', turn_id: 'c1' });
@@ -235,6 +252,20 @@ async function run() {
     replyTextEl.textContent === '回答本文',
     'reply suggestions: final block remains hidden',
   );
+
+  // 9. Preview bubbles participate in the visible count and dismiss on click.
+  ui._dismissAll();
+  const counts = [];
+  const previewRoot = new FakeElement('div');
+  const previewUi = makeBubbleUI({
+    root: previewRoot,
+    onCountChange: (count) => counts.push(count),
+  });
+  previewUi.showPreview('preview');
+  assert(counts.at(-1) === 1, 'preview: visible count enables click reception');
+  previewRoot.children[0].dispatchEvent('click');
+  assert(previewRoot.children.length === 0, 'preview: click removes the bubble');
+  assert(counts.at(-1) === 0, 'preview: dismiss disables click reception');
 
   console.log('\nall paging tests passed.');
 }

@@ -13,7 +13,7 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::{
@@ -23,7 +23,9 @@ use axum::{
 };
 use futures::stream::{self, Stream, StreamExt};
 use serde_json::json;
-use xangi_events_server::{make_state, spawn_pull_client};
+use xangi_events_server::{
+    make_state, spawn_pull_client, spawn_pull_client_with_callbacks, PullConnectionState,
+};
 
 #[derive(Clone)]
 struct SseFrame {
@@ -207,5 +209,72 @@ async fn pull_client_skips_invalid_json_frames() {
     assert!(
         saw_valid,
         "expected the valid frame to still produce a bubble.open despite the bad one",
+    );
+}
+
+#[tokio::test]
+async fn pull_client_reports_handshake_and_only_accepted_events() {
+    let frames = vec![
+        SseFrame {
+            event_type: Some("ready".into()),
+            data: r#"{"instance_id":"xangi-test","host_hint":"unit"}"#.into(),
+        },
+        SseFrame {
+            event_type: None,
+            data: "not-json".into(),
+        },
+        SseFrame {
+            event_type: None,
+            data: serde_json::to_string(&json!({
+                "type": "turn.started",
+                "thread_id": "discord:42",
+                "turn_id": "callback-1",
+            }))
+            .unwrap(),
+        },
+    ];
+    let addr = spawn_fake_xangi(frames).await;
+    let states = Arc::new(Mutex::new(Vec::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+
+    let states_for_callback = states.clone();
+    let events_for_callback = events.clone();
+    let handle = spawn_pull_client_with_callbacks(
+        make_state(),
+        format!("http://{addr}/api/events/stream"),
+        Arc::new(move |state| states_for_callback.lock().unwrap().push(state)),
+        Arc::new(move |event| events_for_callback.lock().unwrap().push(event.clone())),
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let connected = states
+            .lock()
+            .unwrap()
+            .contains(&PullConnectionState::Connected);
+        let received = events.lock().unwrap().len() == 1;
+        if connected && received {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for connection and event callbacks"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    handle.shutdown().await;
+
+    let observed_states = states.lock().unwrap();
+    assert_eq!(
+        observed_states.first(),
+        Some(&PullConnectionState::Connecting)
+    );
+    assert!(observed_states.contains(&PullConnectionState::Connected));
+
+    let observed_events = events.lock().unwrap();
+    assert_eq!(observed_events.len(), 1, "ready and invalid JSON are skipped");
+    assert_eq!(
+        observed_events[0].get("turn_id").and_then(|value| value.as_str()),
+        Some("callback-1")
     );
 }

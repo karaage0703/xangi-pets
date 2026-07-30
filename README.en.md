@@ -14,6 +14,10 @@ A small always-on-top desktop pet for [xangi](https://github.com/karaage0703/xan
 - Speech bubbles for concurrent conversations
 - Long-message paging every four seconds, aligned to complete text lines
 - Send a message by clicking the pet or pressing `t`
+- A persistent menu-bar icon and a normal application menu with show/hide, talk, Web Chat, preferences, and quit actions
+- An in-app Web Chat window, with an option to use the default browser instead
+- Upstream connection status and the per-instance embedded-server port in both menus
+- Optional macOS notifications for newly started turns; no permission prompt on first launch
 - Five pet sizes and five bubble sizes
 - Codex `hatch-pet` compatible sprites and a bundled original `xangi` pet
 - A release bundle verified on macOS with Apple Silicon
@@ -25,6 +29,16 @@ A small always-on-top desktop pet for [xangi](https://github.com/karaage0703/xan
 3. Enter the xangi Web Chat URL when prompted. The local default is `http://localhost:18888`.
 
 For xangi on another machine, use a Web Chat URL reachable over your LAN or Tailscale. Press `x` to change it later.
+
+## Menu bar and application menu
+
+The menu-bar icon remains available while the pet is hidden. The normal application menu exposes the same primary controls whenever xangi-pets is active, so it also provides access when macOS has hidden the status icon among other menu-bar apps.
+
+Both menus can show or hide the pet, open the existing talk dialog, open the configured xangi Web Chat URL in an in-app window or the default browser, change the URL, toggle notifications, show help, or quit.
+
+“Connected” is shown only after the upstream SSE handshake succeeds. If xangi stops, the status changes to reconnecting and returns to connected automatically after recovery. Notifications are opt-in and only fire once for a completion or error belonging to a turn observed after notifications were enabled. Reconnected historical events are not notified. The first message sent from the pet lazily creates a new Web session dedicated to that xangi-pets process. Later messages in the same app run continue that session instead of joining the most recent browser or device session.
+
+Only configured `http://` and `https://` base URLs can be opened. URLs with user information are rejected, and query strings or fragments are removed before storage, display, or opening. On macOS, an App Transport Security exception is limited to embedded web content so WKWebView can display the HTTP endpoints commonly used on localhost, LANs, and Tailscale. The in-app Web Chat is remote content and is not included in the Tauri capability assigned to the pet frontend.
 
 ## Supported release
 
@@ -77,7 +91,8 @@ xangi Web Chat
   └─ GET /api/events/stream (SSE)
        └─ xangi-pets embedded Rust server
             ├─ state aggregation
-            └─ speech-bubble events → Tauri webview
+            ├─ speech-bubble events → pet webview
+            └─ configured xangi URL → in-app Web Chat window
 ```
 
 The pet initiates the SSE connection. Multiple pets can connect without adding callback URLs to xangi.

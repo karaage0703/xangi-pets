@@ -20,6 +20,17 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, Serialize)]
 struct PetInboxRequest<'a> {
     text: &'a str,
+    #[serde(rename = "appSessionId")]
+    app_session_id: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateSessionRequest {}
+
+#[derive(Debug, Deserialize)]
+struct CreateSessionResponse {
+    #[serde(rename = "sessionId")]
+    session_id: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -45,6 +56,59 @@ pub enum PetInboxError {
     Parse(String),
 }
 
+fn client() -> Result<reqwest::Client, PetInboxError> {
+    reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(|e| PetInboxError::Request(e.to_string()))
+}
+
+/// Create a dedicated xangi Web session for this xangi-pets process.
+///
+/// xangi's pet inbox keeps backward compatibility for older senders by
+/// reusing the most recently updated Web session when `appSessionId` is
+/// omitted. xangi-pets must not take that fallback: it would append pet
+/// messages to an unrelated browser/device session. The Tauri layer calls
+/// this lazily for the first pet message and keeps the returned ID for the
+/// lifetime of the app process.
+pub async fn create_pet_session(
+    base_url: &str,
+    token: Option<&str>,
+) -> Result<String, PetInboxError> {
+    let trimmed_url = base_url.trim().trim_end_matches('/');
+    if trimmed_url.is_empty() {
+        return Err(PetInboxError::EmptyUrl);
+    }
+    let url = format!("{trimmed_url}/api/sessions");
+    let client = client()?;
+    let mut req = client.post(&url).json(&CreateSessionRequest {});
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| PetInboxError::Request(e.to_string()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(PetInboxError::Rejected {
+            status: status.as_u16(),
+            body,
+        });
+    }
+    let parsed: CreateSessionResponse = resp
+        .json()
+        .await
+        .map_err(|e| PetInboxError::Parse(e.to_string()))?;
+    if parsed.session_id.trim().is_empty() {
+        return Err(PetInboxError::Parse(
+            "xangi returned an empty sessionId".into(),
+        ));
+    }
+    Ok(parsed.session_id)
+}
+
 /// Send a single text line to `POST /api/pet/inbox` on the upstream xangi.
 ///
 /// `base_url` is the xangi web-chat base (e.g. `http://localhost:18888`).
@@ -61,6 +125,7 @@ pub async fn post_pet_message(
     base_url: &str,
     text: &str,
     token: Option<&str>,
+    app_session_id: &str,
 ) -> Result<PetInboxResponse, PetInboxError> {
     let trimmed_url = base_url.trim().trim_end_matches('/');
     if trimmed_url.is_empty() {
@@ -70,14 +135,20 @@ pub async fn post_pet_message(
     if trimmed_text.is_empty() {
         return Err(PetInboxError::EmptyText);
     }
+    let trimmed_session_id = app_session_id.trim();
+    if trimmed_session_id.is_empty() {
+        return Err(PetInboxError::Parse(
+            "appSessionId is empty; create a dedicated session first".into(),
+        ));
+    }
     let url = format!("{trimmed_url}/api/pet/inbox");
 
-    let client = reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .map_err(|e| PetInboxError::Request(e.to_string()))?;
+    let client = client()?;
 
-    let mut req = client.post(&url).json(&PetInboxRequest { text: trimmed_text });
+    let mut req = client.post(&url).json(&PetInboxRequest {
+        text: trimmed_text,
+        app_session_id: trimmed_session_id,
+    });
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
@@ -105,18 +176,92 @@ pub async fn post_pet_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct CapturedRequests {
+        inbox_bodies: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn create_session_handler() -> Json<Value> {
+        Json(json!({"ok": true, "sessionId": "pet-session-1"}))
+    }
+
+    async fn inbox_handler(
+        State(captured): State<CapturedRequests>,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        captured.inbox_bodies.lock().unwrap().push(body);
+        (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "accepted": true,
+                "instance_id": "pet",
+                "thread_id": "web:pet-session-1",
+                "turn_id": "turn-1",
+                "session_id": "pet-session-1"
+            })),
+        )
+    }
+
+    async fn spawn_xangi_stub() -> (String, CapturedRequests) {
+        let captured = CapturedRequests::default();
+        let app = Router::new()
+            .route("/api/sessions", post(create_session_handler))
+            .route("/api/pet/inbox", post(inbox_handler))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (base_url, captured)
+    }
 
     #[tokio::test]
     async fn empty_url_returns_error() {
-        let err = post_pet_message("", "hello", None).await.unwrap_err();
+        let err = post_pet_message("", "hello", None, "session-1")
+            .await
+            .unwrap_err();
         assert!(matches!(err, PetInboxError::EmptyUrl));
     }
 
     #[tokio::test]
     async fn empty_text_returns_error() {
-        let err = post_pet_message("http://localhost:1", "   ", None)
+        let err = post_pet_message("http://localhost:1", "   ", None, "session-1")
             .await
             .unwrap_err();
         assert!(matches!(err, PetInboxError::EmptyText));
+    }
+
+    #[test]
+    fn pet_message_always_serializes_its_session_id() {
+        let body = serde_json::to_value(PetInboxRequest {
+            text: "hello",
+            app_session_id: "pet-session",
+        })
+        .unwrap();
+        assert_eq!(body["text"], "hello");
+        assert_eq!(body["appSessionId"], "pet-session");
+    }
+
+    #[tokio::test]
+    async fn creates_a_dedicated_session_before_posting_pet_message() {
+        let (base_url, captured) = spawn_xangi_stub().await;
+        let session_id = create_pet_session(&base_url, None).await.unwrap();
+        assert_eq!(session_id, "pet-session-1");
+
+        let response = post_pet_message(&base_url, " hello ", None, &session_id)
+            .await
+            .unwrap();
+        assert!(response.accepted);
+        assert_eq!(response.session_id.as_deref(), Some("pet-session-1"));
+
+        let bodies = captured.inbox_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["text"], "hello");
+        assert_eq!(bodies[0]["appSessionId"], "pet-session-1");
     }
 }
