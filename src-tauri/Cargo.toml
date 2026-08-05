@@ -1,6 +1,6 @@
 [package]
 name = "xangi-pets"
-version = "0.0.8"
+version = "0.0.9"
 description = "Desktop floating pets for xangi"
 authors = ["karaage0703"]
 edition = "2021"

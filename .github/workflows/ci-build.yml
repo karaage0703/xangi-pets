@@ -1,9 +1,8 @@
 name: CI Build
 
 # Triggers:
-# - PR opened/synchronize → 3 platforms build in parallel and upload bundles
-#   as workflow Artifacts so the reviewer can download a real binary and
-#   smoke-test it before merging.
+# - PR opened/synchronize → build the macOS bundle and upload it as a
+#   workflow Artifact so the reviewer can smoke-test it before merging.
 # - workflow_dispatch → ad-hoc rebuild on demand for any branch.
 #
 # Release uploads (draft GitHub Release) live in `release.yml`, triggered by
@@ -18,54 +17,16 @@ on:
   workflow_dispatch:
 
 # A new push to the same PR cancels the in-progress build for that PR. The
-# 3-OS matrix is expensive (especially macOS); no point burning minutes on
-# stale commits.
+# macOS builds are expensive; no point burning minutes on stale commits.
 concurrency:
   group: ci-build-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Globs are restricted to the installer/distribution artifact itself.
-          # `**` would also pick up tauri's intermediate build helpers
-          # (bundle_dmg.sh, support/, .icns templates etc.) that get dumped
-          # into the same dirs, which clutters the downloaded zip.
-          - platform: macos-latest
-            label: macos-arm64
-            bundle_glob: 'src-tauri/target/release/bundle/dmg/*.dmg'
-          - platform: ubuntu-22.04
-            label: linux-x86_64
-            bundle_glob: |
-              src-tauri/target/release/bundle/deb/*.deb
-              src-tauri/target/release/bundle/appimage/*.AppImage
-              src-tauri/target/release/bundle/rpm/*.rpm
-          - platform: windows-latest
-            label: windows-x86_64
-            bundle_glob: |
-              src-tauri/target/release/bundle/msi/*.msi
-              src-tauri/target/release/bundle/nsis/*.exe
-
-    runs-on: ${{ matrix.platform }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install Linux system deps
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            libdbus-1-dev \
-            libssl-dev \
-            libsoup-3.0-dev \
-            build-essential
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -104,10 +65,10 @@ jobs:
           # or touches a GitHub Release. release.yml owns release uploads.
           tagName: ''
 
-      - name: Upload ${{ matrix.label }} bundle
+      - name: Upload macOS bundle
         uses: actions/upload-artifact@v7
         with:
-          name: xangi-pets-${{ matrix.label }}
-          path: ${{ matrix.bundle_glob }}
+          name: xangi-pets-macos-arm64
+          path: 'src-tauri/target/release/bundle/dmg/*.dmg'
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
