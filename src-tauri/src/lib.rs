@@ -8,6 +8,7 @@ use tauri::menu::{
     PredefinedMenuItem, SubmenuBuilder,
 };
 use tauri::tray::TrayIconBuilder;
+use tauri::webview::NewWindowResponse;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, Wry};
 #[cfg(target_os = "macos")]
 use tauri_plugin_notification::NotificationExt;
@@ -100,7 +101,14 @@ impl AppConnectionState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
+    // The embedded Web Chat is a remote page and intentionally has no Tauri IPC
+    // capability. Disable the opener plugin's injected click handler so it does
+    // not prevent `_blank` links before `on_new_window` below can handle them.
+    let builder = tauri::Builder::default().plugin(
+        tauri_plugin_opener::Builder::new()
+            .open_js_links_on_click(false)
+            .build(),
+    );
     #[cfg(target_os = "macos")]
     let builder = builder.plugin(tauri_plugin_notification::init());
 
@@ -800,6 +808,25 @@ fn configured_xangi_url() -> Result<String, String> {
         .ok_or_else(|| "xangi URL is not configured".into())
 }
 
+fn open_web_chat_new_window<F, E>(url: tauri::Url, open_url: F) -> NewWindowResponse<Wry>
+where
+    F: FnOnce(&str) -> Result<(), E>,
+    E: std::fmt::Display,
+{
+    if matches!(url.scheme(), "http" | "https") {
+        if let Err(err) = open_url(url.as_str()) {
+            eprintln!("xangi-pets: open Web Chat link in browser failed: {err}");
+        }
+    } else {
+        eprintln!(
+            "xangi-pets: refused Web Chat new-window URL with unsupported scheme: {}",
+            url.scheme()
+        );
+    }
+
+    NewWindowResponse::Deny
+}
+
 fn open_configured_web_chat_window(app: &AppHandle) -> Result<(), String> {
     let url = tauri::Url::parse(&configured_xangi_url()?)
         .map_err(|_| "configured xangi URL is invalid")?;
@@ -815,12 +842,21 @@ fn open_configured_web_chat_window(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
+    let opener = app.clone();
     WebviewWindowBuilder::new(app, "web-chat", WebviewUrl::External(url))
         .title("xangi Web Chat")
         .inner_size(1100.0, 760.0)
         .min_inner_size(720.0, 480.0)
         .resizable(true)
         .center()
+        .on_new_window(move |url, _features| {
+            open_web_chat_new_window(url, |url| {
+                opener
+                    .opener()
+                    .open_url(url, None::<&str>)
+                    .map_err(|err| err.to_string())
+            })
+        })
         .build()
         .map(|_| ())
         .map_err(|err| err.to_string())
@@ -1005,9 +1041,13 @@ fn cursor_outside_pet(window: &tauri::WebviewWindow) -> Result<bool, ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_xangi_url, notification_transition, truncate_notification};
+    use super::{
+        normalize_xangi_url, notification_transition, open_web_chat_new_window,
+        truncate_notification,
+    };
     use serde_json::json;
     use std::collections::HashSet;
+    use tauri::webview::NewWindowResponse;
 
     #[test]
     fn xangi_url_accepts_http_and_strips_query_and_fragment() {
@@ -1083,5 +1123,33 @@ mod tests {
     fn notification_body_is_unicode_safe() {
         assert_eq!(truncate_notification("あいう", 2), "あい…");
         assert_eq!(truncate_notification("あいう", 3), "あいう");
+    }
+
+    #[test]
+    fn web_chat_new_window_opens_http_url_externally_and_denies_webview_window() {
+        let url = tauri::Url::parse("https://example.test/docs?q=xangi").unwrap();
+        let mut opened = None;
+
+        let response = open_web_chat_new_window(url, |url| {
+            opened = Some(url.to_owned());
+            Ok::<(), &str>(())
+        });
+
+        assert_eq!(opened.as_deref(), Some("https://example.test/docs?q=xangi"));
+        assert!(matches!(response, NewWindowResponse::Deny));
+    }
+
+    #[test]
+    fn web_chat_new_window_rejects_unsafe_scheme() {
+        let url = tauri::Url::parse("javascript:alert('xangi')").unwrap();
+        let mut called = false;
+
+        let response = open_web_chat_new_window(url, |_| {
+            called = true;
+            Ok::<(), &str>(())
+        });
+
+        assert!(!called);
+        assert!(matches!(response, NewWindowResponse::Deny));
     }
 }
