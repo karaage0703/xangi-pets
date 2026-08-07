@@ -10,6 +10,8 @@
 // Cap is small (default 3) — when a 4th bubble arrives, the oldest is dropped
 // silently.
 
+import markdownit from 'markdown-it';
+
 const DEFAULT_MAX = 3;
 const PREVIEW_AUTO_HIDE_MS = 4000;
 const SCROLL_EPSILON_PX = 1;
@@ -17,6 +19,11 @@ const LINE_HEIGHT_BASE_PX = 16.8; // 12px font × the original 1.4 line-height
 const DEFAULT_PAGE_LINES = 4;
 const REPLY_SUGGESTIONS_START = '<xangi_reply_suggestions>';
 const REPLY_SUGGESTIONS_PREFIX = '<xangi_';
+const inlineCodeMarkdown = markdownit('zero', {
+  html: false,
+  linkify: false,
+  typographer: false,
+}).enable('backticks');
 // How long each "page" of an over-long bubble stays on screen before the
 // bubble auto-scrolls to the next page. Loops back to the top after the
 // last page so the user can re-read.
@@ -40,6 +47,28 @@ export function stripInternalReplySuggestions(text) {
     }
   }
   return value;
+}
+
+// Keep the speech-bubble Markdown subset intentionally small. markdown-it
+// handles CommonMark code-span delimiters; the zero preset leaves emphasis,
+// links, images, and raw HTML disabled.
+export function splitInlineCode(text) {
+  const value = String(text ?? '');
+  const [inline] = inlineCodeMarkdown.parseInline(value, {});
+  return (inline?.children ?? []).map((token) => ({
+    text: token.content,
+    code: token.type === 'code_inline',
+  }));
+}
+
+function renderBubbleText(element, text) {
+  element.textContent = '';
+  for (const segment of splitInlineCode(text)) {
+    const node = document.createElement(segment.code ? 'code' : 'span');
+    node.textContent = segment.text;
+    if (segment.code) node.className = 'bubble-inline-code';
+    element.appendChild(node);
+  }
 }
 
 export function bubblePageLayout(scale, pageLines = DEFAULT_PAGE_LINES) {
@@ -306,7 +335,7 @@ export function makeBubbleUI({ root, maxBubbles = DEFAULT_MAX, onCountChange } =
   }
 
   function applyText(b) {
-    b.textEl.textContent = stripInternalReplySuggestions(b.text) || '...';
+    renderBubbleText(b.textEl, stripInternalReplySuggestions(b.text) || '...');
     b.el.classList.toggle('error', b.status === 'error');
     b.el.classList.toggle('closed', b.status === 'closed');
     schedulePaging(b);

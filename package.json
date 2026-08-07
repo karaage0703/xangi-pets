@@ -1,6 +1,6 @@
 {
   "name": "xangi-pets",
-  "version": "0.0.9",
+  "version": "0.0.10",
   "description": "Desktop floating pets for xangi (Codex hatch-pet sprite compatible)",
   "type": "module",
   "private": true,
@@ -8,11 +8,13 @@
     "dev": "vite",
     "test": "node scripts/test-paging.mjs && node scripts/test-window-layout.mjs && node scripts/test-click-gate.mjs",
     "build": "vite build",
+    "licenses:npm": "node scripts/gen-npm-licenses.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.1.1"
+    "@tauri-apps/api": "^2.1.1",
+    "markdown-it": "15.0.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.1.0",

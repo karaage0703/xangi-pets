@@ -35,3 +35,12 @@ cargo install cargo-about --locked --features cli
 ```
 
 Commit the updated `src-tauri/THIRD_PARTY_LICENSES.html` with the dependency change.
+
+When production npm dependencies change, install them and regenerate their bundled notices:
+
+```bash
+npm ci
+npm run licenses:npm
+```
+
+Commit the updated `src-tauri/THIRD_PARTY_NPM_LICENSES.html` with the dependency change.

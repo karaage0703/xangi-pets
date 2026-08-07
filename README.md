@@ -255,12 +255,19 @@ Apache License 2.0（`hatch-pet` 本家と互換）。
 
 - `LICENSE` — 本プロジェクトの Apache License 2.0 全文
 - `THIRD_PARTY_LICENSES.html` — 同梱される Rust crate 全部の attribution（Tauri 2、axum、reqwest など）。`cargo about` で自動生成
+- `THIRD_PARTY_NPM_LICENSES.html` — 同梱される本番 npm package 全部のライセンス。インストール済みpackageから自動生成
 
 依存 crate を追加・更新したら `scripts/gen-licenses.sh` を流して再生成し、`src-tauri/THIRD_PARTY_LICENSES.html` を commit する：
 
 ```bash
 cargo install cargo-about --locked --features cli   # 初回のみ
 ./scripts/gen-licenses.sh
+```
+
+本番npm依存を追加・更新したら、`npm ci`の後にライセンス一覧も再生成する：
+
+```bash
+npm run licenses:npm
 ```
 
 ## 参考
