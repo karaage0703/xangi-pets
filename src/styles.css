@@ -131,6 +131,14 @@ canvas#pet {
   scrollbar-width: none; /* Firefox */
 }
 
+.bubble-inline-code {
+  padding: 0 calc(3px * var(--bubble-scale, 1));
+  border-radius: calc(3px * var(--bubble-scale, 1));
+  background: rgba(0, 0, 0, 0.08);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.92em;
+}
+
 .bubble-text::-webkit-scrollbar {
   display: none; /* WebKit / Chromium */
 }

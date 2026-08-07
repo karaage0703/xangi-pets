@@ -5,6 +5,7 @@
 import {
   bubblePageLayout,
   makeBubbleUI,
+  splitInlineCode,
   stripInternalReplySuggestions,
 } from '../src/lib/bubble.js';
 
@@ -35,18 +36,30 @@ class FakeElement {
   get className() { return [...this._classes].join(' '); }
   set className(v) { this._classes = new Set(String(v).split(/\s+/).filter(Boolean)); }
   set textContent(v) {
+    for (const child of this.children) child.parentNode = null;
+    this.children = [];
     this._textContent = String(v);
+    this.updateLayout();
+  }
+  get textContent() {
+    if (this.children.length > 0) {
+      return this.children.map((child) => child.textContent).join('');
+    }
+    return this._textContent;
+  }
+  updateLayout() {
     // Fake layout: 14px whole-pixel lines and a viewport of exactly four
     // lines, matching the invariant maintained by main.js + styles.css.
-    const lines = Math.max(1, Math.ceil(v.length / 20));
+    const lines = Math.max(1, Math.ceil(this.textContent.length / 20));
     this.scrollHeight = lines * 14;
     this.clientHeight = 56;
   }
-  get textContent() { return this._textContent; }
   appendChild(child) {
     if (child.parentNode) child.parentNode.removeChild(child);
     child.parentNode = this;
     this.children.push(child);
+    this._textContent = '';
+    this.updateLayout();
     return child;
   }
   removeChild(child) {
@@ -253,7 +266,65 @@ async function run() {
     'reply suggestions: final block remains hidden',
   );
 
-  // 9. Preview bubbles participate in the visible count and dismiss on click.
+  // 9. Paired single backticks render as inline code without interpreting
+  // HTML. An incomplete delimiter remains visible until the closing delta.
+  assert(
+    JSON.stringify(splitInlineCode('Use `npm test` now')) ===
+      JSON.stringify([
+        { text: 'Use ', code: false },
+        { text: 'npm test', code: true },
+        { text: ' now', code: false },
+      ]),
+    'inline code: paired single backticks are segmented',
+  );
+  assert(
+    splitInlineCode('waiting for `code').every((segment) => !segment.code),
+    'inline code: unmatched streaming backtick stays plain text',
+  );
+  assert(
+    splitInlineCode('```block```').some(
+      (segment) => segment.code && segment.text === 'block',
+    ),
+    'inline code: CommonMark backtick runs are parsed by markdown-it',
+  );
+  assert(
+    splitInlineCode('<img src=x onerror=alert(1)>').every(
+      (segment) => !segment.code && segment.text.includes('<img'),
+    ),
+    'inline code: raw HTML stays plain text',
+  );
+
+  ui._dismissAll();
+  ui.handle({ type: 'bubble.open', thread_id: 'M', turn_id: 'm1' });
+  ui.handle({
+    type: 'bubble.delta',
+    thread_id: 'M',
+    turn_id: 'm1',
+    text: 'Use `<tag>',
+  });
+  const markdownBubble = root.children[root.children.length - 1];
+  const markdownTextEl = markdownBubble.children[1];
+  assert(
+    markdownTextEl.textContent === 'Use `<tag>',
+    'inline code: incomplete streamed marker remains visible',
+  );
+  ui.handle({
+    type: 'bubble.delta',
+    thread_id: 'M',
+    turn_id: 'm1',
+    text: '` safely',
+  });
+  assert(
+    markdownTextEl.textContent === 'Use <tag> safely',
+    'inline code: delimiters are removed after the closing backtick arrives',
+  );
+  const inlineCode = markdownTextEl.children.find((child) => child.tagName === 'CODE');
+  assert(
+    inlineCode?.textContent === '<tag>' && inlineCode.hasClass('bubble-inline-code'),
+    'inline code: content uses a styled text-only code node',
+  );
+
+  // 10. Preview bubbles participate in the visible count and dismiss on click.
   ui._dismissAll();
   const counts = [];
   const previewRoot = new FakeElement('div');
