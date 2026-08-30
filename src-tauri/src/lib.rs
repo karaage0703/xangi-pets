@@ -39,6 +39,8 @@ struct PullState {
     pet_session_id: Mutex<Option<String>>,
     connection: Mutex<AppConnectionState>,
     notifications_enabled: AtomicBool,
+    normal_responses_enabled: AtomicBool,
+    completion_display_enabled: AtomicBool,
     notification_turns: Mutex<HashSet<String>>,
     generation: AtomicU64,
 }
@@ -49,6 +51,8 @@ struct AppMenuState {
     status: MenuItem<Wry>,
     port: MenuItem<Wry>,
     notifications: CheckMenuItem<Wry>,
+    normal_responses: CheckMenuItem<Wry>,
+    completion_display: CheckMenuItem<Wry>,
 }
 
 static APP_MENU_STATE: OnceLock<AppMenuState> = OnceLock::new();
@@ -180,6 +184,8 @@ pub fn run() {
                 pet_session_id: Mutex::new(None),
                 connection: Mutex::new(AppConnectionState::NotConfigured),
                 notifications_enabled: AtomicBool::new(false),
+                normal_responses_enabled: AtomicBool::new(true),
+                completion_display_enabled: AtomicBool::new(true),
                 notification_turns: Mutex::new(HashSet::new()),
                 generation: AtomicU64::new(0),
             });
@@ -254,6 +260,8 @@ pub fn run() {
             send_pet_message,
             set_notifications_enabled,
             get_notifications_enabled,
+            set_normal_responses_enabled,
+            set_completion_display_enabled,
             get_connection_status,
             open_web_chat
         ])
@@ -426,6 +434,32 @@ fn get_notifications_enabled() -> bool {
         .get()
         .map(|state| state.notifications_enabled.load(Ordering::Relaxed))
         .unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_normal_responses_enabled(enabled: bool) {
+    if let Some(state) = PULL_STATE.get() {
+        state
+            .normal_responses_enabled
+            .store(enabled, Ordering::Relaxed);
+        refresh_tray(&state.app_handle);
+        let _ = state
+            .app_handle
+            .emit("pet://normal-responses-changed", enabled);
+    }
+}
+
+#[tauri::command]
+fn set_completion_display_enabled(enabled: bool) {
+    if let Some(state) = PULL_STATE.get() {
+        state
+            .completion_display_enabled
+            .store(enabled, Ordering::Relaxed);
+        refresh_tray(&state.app_handle);
+        let _ = state
+            .app_handle
+            .emit("pet://completion-display-changed", enabled);
+    }
 }
 
 #[tauri::command]
@@ -647,19 +681,22 @@ fn install_tray(app: &AppHandle) -> tauri::Result<()> {
 }
 
 fn build_tray_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
-    let (connection, notifications_enabled) = PULL_STATE
-        .get()
-        .map(|state| {
-            (
-                state
-                    .connection
-                    .lock()
-                    .map(|value| *value)
-                    .unwrap_or(AppConnectionState::Disconnected),
-                state.notifications_enabled.load(Ordering::Relaxed),
-            )
-        })
-        .unwrap_or((AppConnectionState::NotConfigured, false));
+    let (connection, notifications_enabled, normal_responses_enabled, completion_display_enabled) =
+        PULL_STATE
+            .get()
+            .map(|state| {
+                (
+                    state
+                        .connection
+                        .lock()
+                        .map(|value| *value)
+                        .unwrap_or(AppConnectionState::Disconnected),
+                    state.notifications_enabled.load(Ordering::Relaxed),
+                    state.normal_responses_enabled.load(Ordering::Relaxed),
+                    state.completion_display_enabled.load(Ordering::Relaxed),
+                )
+            })
+            .unwrap_or((AppConnectionState::NotConfigured, false, true, true));
     let status = MenuItemBuilder::with_id("tray_status", format!("xangi: {}", connection.label()))
         .enabled(false)
         .build(app)?;
@@ -686,7 +723,14 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wr
             .build(app)?;
     let preferences =
         MenuItemBuilder::with_id("tray_preferences", "xangi URLを設定…").build(app)?;
-    let notifications = CheckMenuItemBuilder::with_id("tray_notifications", "通知")
+    let normal_responses = CheckMenuItemBuilder::with_id("tray_normal_responses", "通常応答を表示")
+        .checked(normal_responses_enabled)
+        .build(app)?;
+    let completion_display =
+        CheckMenuItemBuilder::with_id("tray_completion_display", "完了通知を表示")
+            .checked(completion_display_enabled)
+            .build(app)?;
+    let notifications = CheckMenuItemBuilder::with_id("tray_notifications", "システム通知")
         .checked(notifications_enabled)
         .build(app)?;
     let help = MenuItemBuilder::with_id("tray_help", "ヘルプ").build(app)?;
@@ -702,6 +746,8 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wr
             &open_chat,
             &open_chat_browser,
             &preferences,
+            &normal_responses,
+            &completion_display,
             &notifications,
             &PredefinedMenuItem::separator(app)?,
             &help,
@@ -770,6 +816,20 @@ fn handle_control_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                 .map(|state| !state.notifications_enabled.load(Ordering::Relaxed))
                 .unwrap_or(false);
             set_notifications_enabled(enabled);
+        }
+        "tray_normal_responses" | "menu_normal_responses" => {
+            let enabled = PULL_STATE
+                .get()
+                .map(|state| !state.normal_responses_enabled.load(Ordering::Relaxed))
+                .unwrap_or(true);
+            set_normal_responses_enabled(enabled);
+        }
+        "tray_completion_display" | "menu_completion_display" => {
+            let enabled = PULL_STATE
+                .get()
+                .map(|state| !state.completion_display_enabled.load(Ordering::Relaxed))
+                .unwrap_or(true);
+            set_completion_display_enabled(enabled);
         }
         "tray_help" | "menu_help" | "menu_about" => {
             show_pet_window(app);
@@ -914,7 +974,14 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
     let prefs = MenuItemBuilder::with_id("menu_prefs", "Preferences (xangi URL)…")
         .accelerator("CmdOrCtrl+,")
         .build(app)?;
-    let notifications = CheckMenuItemBuilder::with_id("menu_notifications", "通知")
+    let normal_responses = CheckMenuItemBuilder::with_id("menu_normal_responses", "通常応答を表示")
+        .checked(true)
+        .build(app)?;
+    let completion_display =
+        CheckMenuItemBuilder::with_id("menu_completion_display", "完了通知を表示")
+            .checked(true)
+            .build(app)?;
+    let notifications = CheckMenuItemBuilder::with_id("menu_notifications", "システム通知")
         .checked(false)
         .build(app)?;
     let help = MenuItemBuilder::with_id("menu_help", "Show Help")
@@ -935,6 +1002,8 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
         .item(&open_chat)
         .item(&open_chat_browser)
         .item(&prefs)
+        .item(&normal_responses)
+        .item(&completion_display)
         .item(&notifications)
         .item(&PredefinedMenuItem::separator(app)?)
         .item(&PredefinedMenuItem::quit(app, None)?)
@@ -962,6 +1031,8 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
         status,
         port,
         notifications,
+        normal_responses,
+        completion_display,
     });
 
     app.on_menu_event(|app, event| {
@@ -975,19 +1046,22 @@ fn refresh_app_menu(_app: &AppHandle) {
     let Some(menu) = APP_MENU_STATE.get() else {
         return;
     };
-    let (connection, notifications_enabled) = PULL_STATE
-        .get()
-        .map(|state| {
-            (
-                state
-                    .connection
-                    .lock()
-                    .map(|value| *value)
-                    .unwrap_or(AppConnectionState::Disconnected),
-                state.notifications_enabled.load(Ordering::Relaxed),
-            )
-        })
-        .unwrap_or((AppConnectionState::NotConfigured, false));
+    let (connection, notifications_enabled, normal_responses_enabled, completion_display_enabled) =
+        PULL_STATE
+            .get()
+            .map(|state| {
+                (
+                    state
+                        .connection
+                        .lock()
+                        .map(|value| *value)
+                        .unwrap_or(AppConnectionState::Disconnected),
+                    state.notifications_enabled.load(Ordering::Relaxed),
+                    state.normal_responses_enabled.load(Ordering::Relaxed),
+                    state.completion_display_enabled.load(Ordering::Relaxed),
+                )
+            })
+            .unwrap_or((AppConnectionState::NotConfigured, false, true, true));
     let port = SERVER_URL
         .get()
         .and_then(|url| url.rsplit(':').next())
@@ -1003,6 +1077,15 @@ fn refresh_app_menu(_app: &AppHandle) {
     }
     if let Err(err) = menu.notifications.set_checked(notifications_enabled) {
         eprintln!("xangi-pets: failed to refresh app menu notifications: {err}");
+    }
+    if let Err(err) = menu.normal_responses.set_checked(normal_responses_enabled) {
+        eprintln!("xangi-pets: failed to refresh normal response setting: {err}");
+    }
+    if let Err(err) = menu
+        .completion_display
+        .set_checked(completion_display_enabled)
+    {
+        eprintln!("xangi-pets: failed to refresh completion display setting: {err}");
     }
 }
 

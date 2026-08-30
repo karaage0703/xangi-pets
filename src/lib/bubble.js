@@ -49,6 +49,30 @@ export function stripInternalReplySuggestions(text) {
   return value;
 }
 
+// Match xangi-stackchan's completion notice style: keep the first useful
+// sentence, remove UI metadata / Markdown noise, and cap it for at-a-glance
+// reading. This is used only when live responses are hidden; the normal mode
+// still preserves the full final response.
+export function summarizeCompletion(text, maxChars = 100) {
+  let cleaned = stripInternalReplySuggestions(text ?? '')
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/\[([^\]]+)]\([^)]+\)/g, '$1')
+    .replace(/^\s{0,3}(?:#{1,6}|[-*+] |\d+[.)] )\s*/gm, '')
+    .replace(/[*_`~]/g, '')
+    .replace(/https?:\/\/\S+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return '作業が完了しました。詳しくはxangiを確認してください。';
+
+  const limit = Math.max(20, Number.isFinite(maxChars) ? Math.trunc(maxChars) : 100);
+  if (cleaned.length > limit) {
+    const sentence = cleaned.slice(0, limit).match(/^.*?[。！？!?](?:\s|$)/)?.[0];
+    cleaned = (sentence || cleaned.slice(0, limit)).trimEnd();
+    if (!/[。！？!?]$/.test(cleaned)) cleaned += '。';
+  }
+  return `作業が完了しました。${cleaned}`;
+}
+
 // Keep the speech-bubble Markdown subset intentionally small. markdown-it
 // handles CommonMark code-span delimiters; the zero preset leaves emphasis,
 // links, images, and raw HTML disabled.
@@ -94,7 +118,13 @@ export function nextPageScrollTop(scrollTop, scrollHeight, clientHeight) {
   return Math.min(scrollTop + clientHeight, max);
 }
 
-export function makeBubbleUI({ root, maxBubbles = DEFAULT_MAX, onCountChange } = {}) {
+export function makeBubbleUI({
+  root,
+  maxBubbles = DEFAULT_MAX,
+  onCountChange,
+  normalResponsesEnabled = true,
+  completionDisplayEnabled = true,
+} = {}) {
   if (!root) throw new Error('makeBubbleUI: root is required');
 
   let lastNotifiedCount = 0;
@@ -157,6 +187,8 @@ export function makeBubbleUI({ root, maxBubbles = DEFAULT_MAX, onCountChange } =
   const bubbles = []; // { id, thread_id, turn_id, text, status, el, textEl, threadEl }
   const dismissedTurnIds = new Set();
   const maxDismissedTurnIds = 128;
+  let showNormalResponses = normalResponsesEnabled !== false;
+  let showCompletions = completionDisplayEnabled !== false;
 
   function bubbleId(thread_id, turn_id) {
     return `${thread_id}\u0000${turn_id}`;
@@ -373,16 +405,19 @@ export function makeBubbleUI({ root, maxBubbles = DEFAULT_MAX, onCountChange } =
     }
     switch (ev.type) {
       case 'bubble.snapshot': {
+        if (!showNormalResponses) break;
         // A bubble that was already open before we connected. Treat it like
         // the open + (current text) state.
         open(ev.thread_id, ev.turn_id, ev.text ?? '');
         break;
       }
       case 'bubble.open': {
+        if (!showNormalResponses) break;
         open(ev.thread_id, ev.turn_id, '');
         break;
       }
       case 'bubble.delta': {
+        if (!showNormalResponses) break;
         let b = find(ev.thread_id, ev.turn_id);
         if (!b) {
           // Implicit open if delta arrives before we saw bubble.open
@@ -396,12 +431,19 @@ export function makeBubbleUI({ root, maxBubbles = DEFAULT_MAX, onCountChange } =
         break;
       }
       case 'bubble.close': {
+        if (!showCompletions) {
+          const current = find(ev.thread_id, ev.turn_id);
+          if (current) removeBubble(current);
+          break;
+        }
         const b = find(ev.thread_id, ev.turn_id);
         if (!b) {
           // Closed without ever being open in our view — synthesize the final
           // bubble so the user still sees the message.
           const synth = createBubble(ev.thread_id, ev.turn_id);
-          synth.text = ev.last_message ?? '';
+          synth.text = showNormalResponses
+            ? (ev.last_message ?? '')
+            : summarizeCompletion(ev.last_message ?? '');
           synth.status = 'closed';
           pushBubble(synth);
           applyText(synth);
@@ -440,8 +482,28 @@ export function makeBubbleUI({ root, maxBubbles = DEFAULT_MAX, onCountChange } =
     }
   }
 
+  function setDisplayPreferences({ normalResponses, completions } = {}) {
+    if (typeof normalResponses === 'boolean') {
+      showNormalResponses = normalResponses;
+      if (!showNormalResponses) {
+        for (const bubble of [...bubbles]) {
+          if (bubble.status === 'open') removeBubble(bubble);
+        }
+      }
+    }
+    if (typeof completions === 'boolean') {
+      showCompletions = completions;
+      if (!showCompletions) {
+        for (const bubble of [...bubbles]) {
+          if (bubble.status === 'closed') removeBubble(bubble);
+        }
+      }
+    }
+  }
+
   return {
     handle,
+    setDisplayPreferences,
     showPreview,
     clearPreview,
     // Test seam.
