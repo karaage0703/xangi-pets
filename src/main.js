@@ -434,6 +434,8 @@ const helpState = {
   petName: null,
   connection: 'not-configured',
   notificationsEnabled: false,
+  normalResponsesEnabled: true,
+  completionDisplayEnabled: true,
 };
 
 function isHelpOpen() {
@@ -532,7 +534,9 @@ function renderHelpState() {
       helpState.connection === 'connected' ? 'help-ok' : 'help-warn',
       '未設定',
     ),
-    helpRow('通知', helpState.notificationsEnabled ? 'ON' : 'OFF', '', 'OFF'),
+    helpRow('通常応答', helpState.normalResponsesEnabled ? 'ON' : 'OFF', '', 'ON'),
+    helpRow('完了通知', helpState.completionDisplayEnabled ? 'ON' : 'OFF', '', 'ON'),
+    helpRow('システム通知', helpState.notificationsEnabled ? 'ON' : 'OFF', '', 'OFF'),
     helpRow('ペット', helpState.petName, '', '未選択'),
     helpRow('サーバ', helpState.serverUrl || '', '', '-'),
   ];
@@ -1139,9 +1143,19 @@ async function main() {
   storageNamespace = deriveNamespace(serverUrl);
   console.info(`xangi-pets: storage namespace = ${storageNamespace || '(none)'}`);
   const notificationsEnabled = readStorage('notifications') === '1';
+  const normalResponsesEnabled = readStorage('normal-responses') !== '0';
+  const completionDisplayEnabled = readStorage('completion-display') !== '0';
   await tauriInvoke('set_notifications_enabled', { enabled: notificationsEnabled }).catch((err) => {
     console.warn('xangi-pets: notification preference could not be applied', err);
   });
+  await tauriInvoke('set_normal_responses_enabled', { enabled: normalResponsesEnabled }).catch(
+    (err) => console.warn('xangi-pets: normal response preference could not be applied', err),
+  );
+  await tauriInvoke('set_completion_display_enabled', {
+    enabled: completionDisplayEnabled,
+  }).catch((err) =>
+    console.warn('xangi-pets: completion display preference could not be applied', err),
+  );
 
   // Subscribe only after restoring the notification preference. That closes
   // the startup race where a new turn could begin between the SSE handshake
@@ -1217,6 +1231,8 @@ async function main() {
     // The stage fitter below handles the rendered height of the remaining
     // bubbles, including thread labels and streamed text.
     maxBubbles: 2,
+    normalResponsesEnabled,
+    completionDisplayEnabled,
     onCountChange: (count) => {
       // Tell Rust whether at least one bubble is on screen. Rust uses this
       // to decide whether the whole window should accept clicks (so the user
@@ -1277,6 +1293,8 @@ async function main() {
     petScale: spriteScale,
     bubbleScale,
     notificationsEnabled: readStorage('notifications') === '1',
+    normalResponsesEnabled: readStorage('normal-responses') !== '0',
+    completionDisplayEnabled: readStorage('completion-display') !== '0',
   });
 
   // Seed the help-overlay state immediately so a `pet://show-help` event
@@ -1301,6 +1319,18 @@ async function main() {
     const enabled = payload === true;
     writeStorage('notifications', enabled ? '1' : '0');
     updateHelpState({ notificationsEnabled: enabled });
+  });
+  await tauriListen('pet://normal-responses-changed', ({ payload }) => {
+    const enabled = payload === true;
+    writeStorage('normal-responses', enabled ? '1' : '0');
+    bubbleUi.setDisplayPreferences({ normalResponses: enabled });
+    updateHelpState({ normalResponsesEnabled: enabled });
+  });
+  await tauriListen('pet://completion-display-changed', ({ payload }) => {
+    const enabled = payload === true;
+    writeStorage('completion-display', enabled ? '1' : '0');
+    bubbleUi.setDisplayPreferences({ completions: enabled });
+    updateHelpState({ completionDisplayEnabled: enabled });
   });
   const connection = await tauriInvoke('get_connection_status').catch(() => 'not-configured');
   updateHelpState({ connection: String(connection ?? 'not-configured') });

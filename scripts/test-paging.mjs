@@ -7,6 +7,7 @@ import {
   makeBubbleUI,
   splitInlineCode,
   stripInternalReplySuggestions,
+  summarizeCompletion,
 } from '../src/lib/bubble.js';
 
 class FakeElement {
@@ -337,6 +338,52 @@ async function run() {
   previewRoot.children[0].dispatchEvent('click');
   assert(previewRoot.children.length === 0, 'preview: click removes the bubble');
   assert(counts.at(-1) === 0, 'preview: dismiss disables click reception');
+
+  // 11. Completion-only mode suppresses streaming conversation and creates
+  // exactly one final bubble when the turn closes.
+  const completionRoot = new FakeElement('div');
+  const completionUi = makeBubbleUI({
+    root: completionRoot,
+    normalResponsesEnabled: false,
+    completionDisplayEnabled: true,
+  });
+  completionUi.handle({ type: 'bubble.open', thread_id: 'N', turn_id: 'n1' });
+  completionUi.handle({
+    type: 'bubble.delta',
+    thread_id: 'N',
+    turn_id: 'n1',
+    text: '会話中',
+  });
+  assert(completionRoot.children.length === 0, 'completion-only: streaming stays hidden');
+  completionUi.handle({
+    type: 'bubble.close',
+    thread_id: 'N',
+    turn_id: 'n1',
+    last_message: '作業が完了しました',
+  });
+  assert(completionRoot.children.length === 1, 'completion-only: final bubble appears');
+  assert(
+    completionRoot.children[0].children[1].textContent ===
+      '作業が完了しました。作業が完了しました',
+    'completion-only: final summary is displayed',
+  );
+  assert(
+    summarizeCompletion(
+      '## 結果\n- [設定](https://example.com)を更新しました。\n<xangi_reply_suggestions>["次へ"]</xangi_reply_suggestions>',
+      80,
+    ) === '作業が完了しました。結果 設定を更新しました。',
+    'completion summary: Markdown and reply metadata are removed',
+  );
+
+  completionUi.setDisplayPreferences({ completions: false });
+  assert(completionRoot.children.length === 0, 'completion toggle: existing finals are hidden');
+  completionUi.handle({
+    type: 'bubble.close',
+    thread_id: 'N',
+    turn_id: 'n2',
+    last_message: '表示しない完了',
+  });
+  assert(completionRoot.children.length === 0, 'completion toggle: new finals stay hidden');
 
   console.log('\nall paging tests passed.');
 }

@@ -17,7 +17,8 @@ A small always-on-top desktop pet for [xangi](https://github.com/karaage0703/xan
 - A persistent menu-bar icon and a normal application menu with show/hide, talk, Web Chat, preferences, and quit actions
 - An in-app Web Chat window, with an option to use the default browser instead
 - Upstream connection status and the per-instance embedded-server port in both menus
-- Optional macOS notifications for newly started turns; no permission prompt on first launch
+- Independent speech-bubble toggles for live responses and completion messages, including a completion-only mode
+- Optional macOS system notifications for newly started turns; no permission prompt on first launch
 - Five pet sizes and five bubble sizes
 - Codex `hatch-pet` compatible sprites and a bundled original `xangi` pet
 - A release bundle verified on macOS with Apple Silicon
