@@ -1,12 +1,12 @@
 {
   "name": "xangi-pets",
-  "version": "0.0.11",
+  "version": "0.0.12",
   "description": "Desktop floating pets for xangi (Codex hatch-pet sprite compatible)",
   "type": "module",
   "private": true,
   "scripts": {
     "dev": "vite",
-    "test": "node scripts/test-paging.mjs && node scripts/test-window-layout.mjs && node scripts/test-click-gate.mjs",
+    "test": "node scripts/test-paging.mjs && node scripts/test-window-layout.mjs && node scripts/test-click-gate.mjs && node scripts/test-connection-profiles.mjs",
     "build": "vite build",
     "licenses:npm": "node scripts/gen-npm-licenses.mjs",
     "preview": "vite preview",

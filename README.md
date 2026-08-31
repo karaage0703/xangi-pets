@@ -189,8 +189,12 @@ open -n -a /Applications/xangi-pets.app
 
 - 内蔵 HTTP サーバの port は **7895 → 7896 → … と auto-shift**（`PORT_AUTOSHIFT_TRIES=10`）するので、port 衝突しない
 - 各プロセスのメニューバーtooltipと状態行に実際のbound portを表示するため、複数インスタンスを識別できる
-- localStorage キーは **bound port を namespace に使う**（例: `xangi-pets:7895:name` / `xangi-pets:7896:name`）。WKWebView は同 bundle の複数プロセス間で localStorage を共有するが、port namespace で衝突を回避
+- 接続後のlocalStorageキーは **接続プロファイルIDをnamespaceに使う**。各起動slotは選択したプロファイルを記憶し、キャラ・サイズ・通知設定を接続先ごとに分離する
 - 既存ユーザの `xangi-pets:name` 等は legacy fallback として読み込まれる（破壊的変更なし）
+
+起動時の接続先ピッカーで、xangiの名前・イベントAPI URL・Web UIの有無を「接続プロファイル」として保存できる。「＋ 新しい接続先を追加」を選ぶと既存設定を上書きせずに登録する。接続プロファイル一覧はTauriの共通設定へ保存され、内蔵サーバのポートが異なる複数のペットから同じ一覧を選べる。複数起動した新しいペットで保存済みプロファイルを選ぶと、以後はそのペットが同じxangiへ自動再接続する。キャラ・サイズ・通知設定もプロファイル単位で保持される。
+
+Web UIなしのxangiは「Web UIも利用する」をOFFにする。イベント表示とペットからの入力は維持し、Web Chatメニューだけが無効になる。xangi側は `XANGI_EVENTS_SERVER_ENABLED=true` のheadless companion APIを使う。
 
 `npm run tauri dev` の多重起動は **vite dev サーバ（:1420 strictPort）が衝突するので非対応**。複数起動はビルド版でやる。
 

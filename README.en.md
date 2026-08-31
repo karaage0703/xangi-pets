@@ -27,15 +27,17 @@ A small always-on-top desktop pet for [xangi](https://github.com/karaage0703/xan
 
 1. On a Mac with Apple Silicon, download the `.dmg` from [Releases](https://github.com/karaage0703/xangi-pets/releases).
 2. Install and launch it. See [Installation](docs/INSTALL.md) for unsigned-app warnings.
-3. Enter the xangi Web Chat URL when prompted. The local default is `http://localhost:18888`.
+3. Create a connection profile when prompted. Give it a name, enter the xangi event API URL, and specify whether that xangi instance provides a Web UI. The local default is `http://localhost:18888`.
 
-For xangi on another machine, use a Web Chat URL reachable over your LAN or Tailscale. Press `x` to change it later.
+For xangi on another machine, use an event API URL reachable over your LAN or Tailscale. Press `x` to choose an existing profile, update the active profile, add a new one, or disconnect the current pet. The shared profile list is stored in the Tauri app configuration so every pet process can see the same connections. Each pet window remembers its selected profile, while character, size, notifications, and screen position remain separated by profile.
+
+For a xangi instance without Web Chat, set `XANGI_EVENTS_SERVER_ENABLED=true` on xangi and turn off **Web UI available** in its xangi-pets profile. The pet remains fully usable, while menu items that would open Web Chat are disabled.
 
 ## Menu bar and application menu
 
 The menu-bar icon remains available while the pet is hidden. The normal application menu exposes the same primary controls whenever xangi-pets is active, so it also provides access when macOS has hidden the status icon among other menu-bar apps.
 
-Both menus can show or hide the pet, open the existing talk dialog, open the configured xangi Web Chat URL in an in-app window or the default browser, change the URL, toggle notifications, show help, or quit.
+Both menus can show or hide the pet, open the existing talk dialog, open the configured xangi Web Chat URL in an in-app window or the default browser when available, change the connection profile, toggle notifications, show help, or quit.
 
 “Connected” is shown only after the upstream SSE handshake succeeds. If xangi stops, the status changes to reconnecting and returns to connected automatically after recovery. Notifications are opt-in and only fire once for a completion or error belonging to a turn observed after notifications were enabled. Reconnected historical events are not notified. The first message sent from the pet lazily creates a new Web session dedicated to that xangi-pets process. Later messages in the same app run continue that session instead of joining the most recent browser or device session.
 

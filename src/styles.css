@@ -430,6 +430,7 @@ canvas#pet {
   z-index: 250;
   padding: 12px;
   box-sizing: border-box;
+  overflow-y: auto;
 }
 
 .xangi-url-card {
@@ -437,6 +438,54 @@ canvas#pet {
      and the layout of the input + actions row. */
   min-width: 240px;
   max-width: 300px;
+  max-height: 100%;
+  overflow-y: auto;
+}
+
+.connection-profile-list {
+  display: flex;
+  max-height: 112px;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+  margin-bottom: 10px;
+}
+
+.connection-profile-list .new-profile {
+  border-style: dashed;
+  color: #245f9e;
+}
+
+.xangi-profile-field {
+  display: grid;
+  gap: 4px;
+  margin-top: 8px;
+  color: #555;
+  font-size: 11px;
+}
+
+.xangi-profile-field > span {
+  font-weight: 600;
+}
+
+.xangi-profile-name,
+.xangi-url-card .xangi-url-input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.xangi-profile-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  color: #555;
+  font-size: 11px;
+}
+
+.xangi-profile-check input {
+  width: 16px;
+  height: 16px;
 }
 
 .xangi-url-card .xangi-url-input {

@@ -7,6 +7,12 @@
 import { bubblePageLayout, makeBubbleUI, subscribeBubbles } from './lib/bubble.js';
 import { makeClickGateController } from './lib/click-gate.js';
 import { fitWindowSize } from './lib/window-layout.js';
+import {
+  findProfile,
+  normalizeProfile,
+  parseProfiles,
+  upsertProfile,
+} from './lib/connection-profiles.js';
 
 const CELL_W = 192;
 const CELL_H = 208;
@@ -126,6 +132,88 @@ function deriveNamespace(serverUrl) {
 // different xangi URLs, launch them with the `XANGI_URL` env var set
 // per-process, or set them sequentially via the `x` key after launch.
 const XANGI_URL_KEY = `${STORAGE_PREFIX}:xangi-url`;
+const CONNECTION_PROFILES_KEY = `${STORAGE_PREFIX}:connection-profiles`; // legacy migration / browser dev
+let instanceNamespace = '';
+let activeProfile = null;
+let positionTrackingInstalled = false;
+
+async function readConnectionProfiles() {
+  const legacy = parseProfiles(globalThis.localStorage?.getItem(CONNECTION_PROFILES_KEY));
+  try {
+    let profiles = parseProfiles(JSON.stringify(await tauriInvoke('get_connection_profiles')));
+    for (const profile of legacy) {
+      profiles = parseProfiles(JSON.stringify(await tauriInvoke('upsert_connection_profile', { profile })));
+    }
+    if (legacy.length > 0) globalThis.localStorage?.removeItem(CONNECTION_PROFILES_KEY);
+    return profiles;
+  } catch {
+    return legacy;
+  }
+}
+
+async function writeConnectionProfile(profile) {
+  try {
+    return parseProfiles(JSON.stringify(await tauriInvoke('upsert_connection_profile', { profile })));
+  } catch {
+    const profiles = upsertProfile(
+      parseProfiles(globalThis.localStorage?.getItem(CONNECTION_PROFILES_KEY)),
+      profile,
+    );
+    globalThis.localStorage?.setItem(CONNECTION_PROFILES_KEY, JSON.stringify(profiles));
+    return profiles;
+  }
+}
+
+function assignedProfileKey() {
+  return `${STORAGE_PREFIX}:${instanceNamespace}:active-profile`;
+}
+
+function activateProfile(profile) {
+  activeProfile = profile;
+  storageNamespace = `profile:${profile.id}`;
+  globalThis.localStorage?.setItem(assignedProfileKey(), profile.id);
+  writeXangiUrl(profile.url);
+}
+
+async function applyConnectionProfile(profile) {
+  const applied = await tauriInvoke('set_xangi_url', { url: profile.url });
+  const normalized = { ...profile, url: typeof applied === 'string' ? applied : profile.url };
+  activateProfile(normalized);
+  await tauriInvoke('set_web_ui_enabled', { enabled: normalized.webUiEnabled }).catch((err) => {
+    console.warn('xangi-pets: Web UI availability could not be applied', err);
+  });
+  return normalized;
+}
+
+async function restoreWindowPosition() {
+  const rawX = readStorage('window-x');
+  const rawY = readStorage('window-y');
+  if (rawX === null || rawY === null) return;
+  const x = Number(rawX);
+  const y = Number(rawY);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+  try {
+    const { getCurrentWindow } = await import('@tauri-apps/api/window');
+    const { PhysicalPosition } = await import('@tauri-apps/api/dpi');
+    await getCurrentWindow().setPosition(new PhysicalPosition(x, y));
+  } catch {
+    // Browser dev mode or a platform that cannot restore an absolute position.
+  }
+}
+
+async function installWindowPositionTracking() {
+  if (positionTrackingInstalled) return;
+  try {
+    const { getCurrentWindow } = await import('@tauri-apps/api/window');
+    await getCurrentWindow().onMoved(({ payload }) => {
+      writeStorage('window-x', String(payload.x));
+      writeStorage('window-y', String(payload.y));
+    });
+    positionTrackingInstalled = true;
+  } catch {
+    // Browser dev mode.
+  }
+}
 
 function readXangiUrl() {
   const fromStorage = globalThis.localStorage?.getItem(XANGI_URL_KEY) ?? '';
@@ -160,50 +248,57 @@ async function tauriInvoke(name, args) {
  * Returns the URL we ended up applying, or `null` when no URL is configured.
  */
 async function ensureXangiUrl() {
+  let profiles = await readConnectionProfiles();
   // 1. Rust side already has a URL?
   try {
     const cur = await tauriInvoke('get_xangi_url');
     if (typeof cur === 'string' && cur) {
-      // Mirror to localStorage so the prompt next time has the right default.
-      writeXangiUrl(cur);
+      const profile = profiles.find((value) => value.url === cur) ||
+        normalizeProfile({ name: new URL(cur).hostname || 'xangi', url: cur });
+      profiles = await writeConnectionProfile(profile);
+      activateProfile(profile);
       return cur;
     }
   } catch {
-    // Browser dev mode — no Tauri commands available.
-    return readXangiUrl() || null;
+    // Browser dev mode has no Tauri commands. Continue into the same picker
+    // so the onboarding UI can still be rendered and tested in Vite.
   }
 
-  // 2. localStorage / env fallback.
-  const saved = readXangiUrl();
-  if (saved) {
+  // 2. Restore the profile assigned to this pet process slot. One saved
+  // profile can be restored without asking; multiple profiles show a picker
+  // the first time a new slot is launched.
+  const assignedId = globalThis.localStorage?.getItem(assignedProfileKey());
+  const assigned = findProfile(profiles, assignedId);
+  const automatic = assigned || (profiles.length === 1 ? profiles[0] : null);
+  if (automatic) {
     try {
-      const applied = await tauriInvoke('set_xangi_url', { url: saved });
-      if (typeof applied === 'string' && applied) {
-        return applied;
-      }
+      const applied = await applyConnectionProfile(automatic);
+      return applied.url;
     } catch (err) {
-      console.warn(`xangi-pets: saved xangi URL ${saved} rejected by Rust: ${err}`);
+      console.warn(`xangi-pets: saved profile ${automatic.name} rejected by Rust: ${err}`);
     }
   }
 
-  // 3. Show the in-app modal. We can't use window.prompt() — Tauri 2's
-  //    WKWebView blocks it (no-ops silently), which used to make the `x` key
-  //    feel broken. The custom modal also lets us offer a "接続解除" button.
-  const result = await pickXangiUrl(saved);
+  // Legacy single-URL users get that value pre-filled for migration.
+  const saved = readXangiUrl();
+  const result = await pickXangiUrl(profiles, null, saved);
   if (!result || result.action === 'cancel') {
     console.warn('xangi-pets: xangi URL not configured. Press `x` to set it later.');
     return null;
   }
   if (result.action === 'disconnect') {
     writeXangiUrl('');
+    globalThis.localStorage?.removeItem(assignedProfileKey());
+    activeProfile = null;
+    storageNamespace = instanceNamespace;
     return null;
   }
-  const entered = result.url;
-  if (!entered) return null;
+  const profile = result.profile;
+  if (!profile) return null;
   try {
-    const applied = await tauriInvoke('set_xangi_url', { url: entered });
-    writeXangiUrl(typeof applied === 'string' ? applied : entered);
-    return typeof applied === 'string' ? applied : entered;
+    profiles = await writeConnectionProfile(profile);
+    const applied = await applyConnectionProfile(profile);
+    return applied.url;
   } catch (err) {
     console.error(`xangi-pets: set_xangi_url failed: ${err}`);
     return null;
@@ -577,14 +672,16 @@ function showHelpOverlay(ctx) {
 //
 // Same picker-overlay CSS as pickPet so the look stays
 // consistent. Esc/backdrop-click/Cancel button all resolve as 'cancel'.
-async function pickXangiUrl(currentUrl) {
-  const initial = currentUrl || 'http://localhost:18888';
-  const hasCurrent = !!currentUrl;
+async function pickXangiUrl(profiles, currentProfile, legacyUrl = '') {
+  const initial = currentProfile?.url || legacyUrl || 'http://localhost:18888';
+  const initialName = currentProfile?.name || '';
+  const hasCurrent = !!currentProfile;
+  let editingProfileId = currentProfile?.id || null;
 
   // Grow the pet window so the input is comfortable to type / paste into,
   // and so the Cmd+drag text-selection has something bigger than 280px to
   // work with. Stash the old size/pos and restore them in cleanup().
-  const sizeRestore = await growWindowForModal(460, 320);
+  const sizeRestore = await growWindowForModal(460, 440);
   // Force-accept clicks for the duration of the modal — the pet's
   // click-through polling would otherwise eat clicks on the input field.
   await pushModalClickGate();
@@ -595,10 +692,27 @@ async function pickXangiUrl(currentUrl) {
     overlay.innerHTML = `
       <div class="picker-card xangi-url-card">
         <strong>xangi の接続先</strong>
-        <p class="picker-hint">xangi 本体の URL（pull 元）。<kbd>Esc</kbd> でキャンセル</p>
+        <p class="picker-hint">保存済みの接続先を選ぶか、新しいxangiを登録します。</p>
+        <div class="connection-profile-list">
+          ${profiles
+            .map(
+              (profile) => `<button type="button" class="picker-item${profile.id === currentProfile?.id ? ' current' : ''}" data-profile-id="${escapeHtml(profile.id)}">
+                <span class="picker-main">${escapeHtml(profile.name)}</span>
+                <span class="picker-sub">${escapeHtml(profile.url)}${profile.webUiEnabled ? '' : ' · Web UIなし'}</span>
+              </button>`,
+            )
+            .join('')}
+          <button type="button" class="picker-item new-profile" data-action="new-profile">
+            <span class="picker-main">＋ 新しい接続先を追加</span>
+          </button>
+        </div>
+        <label class="xangi-profile-field"><span>名前</span><input type="text" class="xangi-profile-name" value="${escapeHtml(initialName)}" placeholder="xangi-a" autocomplete="off" /></label>
+        <label class="xangi-profile-field"><span>イベントAPI</span>
         <input type="url" class="xangi-url-input" value="${escapeHtml(initial)}" placeholder="http://localhost:18888" spellcheck="false" autocomplete="off" />
+        </label>
+        <label class="xangi-profile-check"><input type="checkbox" class="xangi-web-ui-enabled" ${currentProfile?.webUiEnabled === false ? '' : 'checked'} /> Web UIも利用する</label>
         <div class="xangi-url-actions">
-          <button type="button" class="picker-btn primary" data-action="connect">接続</button>
+          <button type="button" class="picker-btn primary" data-action="connect">保存して接続</button>
           ${
             hasCurrent
               ? '<button type="button" class="picker-btn ghost" data-action="disconnect">接続解除</button>'
@@ -609,6 +723,8 @@ async function pickXangiUrl(currentUrl) {
       </div>
     `;
     const input = overlay.querySelector('.xangi-url-input');
+    const nameInput = overlay.querySelector('.xangi-profile-name');
+    const webUiInput = overlay.querySelector('.xangi-web-ui-enabled');
 
     let resolved = false;
     async function cleanup(result) {
@@ -629,7 +745,13 @@ async function pickXangiUrl(currentUrl) {
       if (ev.key === 'Enter' && document.activeElement === input) {
         ev.preventDefault();
         ev.stopPropagation();
-        cleanup({ action: 'connect', url: input.value.trim() });
+        const profile = normalizeProfile({
+          id: editingProfileId,
+          name: nameInput.value,
+          url: input.value,
+          webUiEnabled: webUiInput.checked,
+        });
+        if (profile) cleanup({ action: 'connect', profile });
       }
     }
 
@@ -640,7 +762,26 @@ async function pickXangiUrl(currentUrl) {
         return;
       }
       const action = ev.target?.dataset?.action;
-      if (action === 'connect') cleanup({ action: 'connect', url: input.value.trim() });
+      const profileId = ev.target?.closest?.('[data-profile-id]')?.dataset?.profileId;
+      if (profileId) {
+        const selected = findProfile(profiles, profileId);
+        if (selected) cleanup({ action: 'connect', profile: selected });
+      } else if (action === 'new-profile' || ev.target?.closest?.('[data-action="new-profile"]')) {
+        editingProfileId = null;
+        overlay.querySelectorAll('[data-profile-id]').forEach((item) => item.classList.remove('current'));
+        nameInput.value = '';
+        input.value = 'http://localhost:18888';
+        webUiInput.checked = true;
+        nameInput.focus();
+      } else if (action === 'connect') {
+        const profile = normalizeProfile({
+          id: editingProfileId,
+          name: nameInput.value,
+          url: input.value,
+          webUiEnabled: webUiInput.checked,
+        });
+        if (profile) cleanup({ action: 'connect', profile });
+      }
       else if (action === 'disconnect') cleanup({ action: 'disconnect' });
       else if (action === 'cancel') cleanup({ action: 'cancel' });
     });
@@ -703,8 +844,8 @@ async function growWindowForModal(targetW, targetH) {
 // Used by the `x` key, the macOS menu's Preferences item, and the
 // first-launch onboarding flow.
 async function runSetXangiUrlPrompt(bubbleUi) {
-  const cur = readXangiUrl();
-  const result = await pickXangiUrl(cur);
+  let profiles = await readConnectionProfiles();
+  const result = await pickXangiUrl(profiles, activeProfile, readXangiUrl());
   if (!result || result.action === 'cancel') return;
 
   if (result.action === 'disconnect') {
@@ -714,18 +855,23 @@ async function runSetXangiUrlPrompt(bubbleUi) {
       console.warn(`clear_xangi_url failed: ${err}`);
     }
     writeXangiUrl('');
+    globalThis.localStorage?.removeItem(assignedProfileKey());
+    activeProfile = null;
+    storageNamespace = instanceNamespace;
+    await tauriInvoke('set_web_ui_enabled', { enabled: false }).catch(() => {});
     updateHelpState({ xangiUrl: null });
     bubbleUi?.showPreview?.('xangi 接続を解除しました');
     return;
   }
 
   // action === 'connect'
-  const trimmed = result.url;
-  if (!trimmed) return;
+  const profile = result.profile;
+  if (!profile) return;
   try {
-    const applied = await tauriInvoke('set_xangi_url', { url: trimmed });
-    const value = typeof applied === 'string' ? applied : trimmed;
-    writeXangiUrl(value);
+    profiles = await writeConnectionProfile(profile);
+    const applied = await applyConnectionProfile(profile);
+    const value = applied.url;
+    await restoreWindowPosition();
     updateHelpState({ xangiUrl: value });
     bubbleUi?.showPreview?.(`xangi URL: ${value}`);
     console.info(`xangi-pets: xangi URL -> ${value}`);
@@ -1034,6 +1180,7 @@ function startWandering(renderer) {
   async function wanderOnce() {
     if (busy) return;
     if (renderer.getState() !== 'idle') return;
+    if (document.querySelector('#pet-message-modal, #xangi-url-modal, #help-overlay, .picker-overlay')) return;
     busy = true;
     try {
       const w = await import('@tauri-apps/api/window');
@@ -1140,7 +1287,15 @@ async function main() {
   // localStorage namespace. Two `open -n` instances will have different
   // ports and thus separate pet/bubble-scale settings; a single instance
   // still inherits the legacy unprefixed values via readStorage's fallback.
-  storageNamespace = deriveNamespace(serverUrl);
+  instanceNamespace = deriveNamespace(serverUrl);
+  storageNamespace = instanceNamespace;
+
+  // Resolve the named connection before reading visual preferences. Once a
+  // profile is active, pet/scale/position settings follow that xangi instead
+  // of the auto-shifted local port.
+  const xangiUrl = await ensureXangiUrl();
+  await restoreWindowPosition();
+  await installWindowPositionTracking();
   console.info(`xangi-pets: storage namespace = ${storageNamespace || '(none)'}`);
   const notificationsEnabled = readStorage('notifications') === '1';
   const normalResponsesEnabled = readStorage('normal-responses') !== '0';
@@ -1160,7 +1315,6 @@ async function main() {
   // Subscribe only after restoring the notification preference. That closes
   // the startup race where a new turn could begin between the SSE handshake
   // and applying a persisted "notifications on" setting.
-  const xangiUrl = await ensureXangiUrl();
   if (xangiUrl) {
     console.info(`xangi-pets: subscribing to xangi at ${xangiUrl}/api/events/stream`);
   } else {

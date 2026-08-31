@@ -1,4 +1,8 @@
+use fs2::FileExt;
+use serde_json::Value;
 use std::collections::HashSet;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -41,6 +45,7 @@ struct PullState {
     notifications_enabled: AtomicBool,
     normal_responses_enabled: AtomicBool,
     completion_display_enabled: AtomicBool,
+    web_ui_enabled: AtomicBool,
     notification_turns: Mutex<HashSet<String>>,
     generation: AtomicU64,
 }
@@ -53,6 +58,8 @@ struct AppMenuState {
     notifications: CheckMenuItem<Wry>,
     normal_responses: CheckMenuItem<Wry>,
     completion_display: CheckMenuItem<Wry>,
+    open_chat: MenuItem<Wry>,
+    open_chat_browser: MenuItem<Wry>,
 }
 
 static APP_MENU_STATE: OnceLock<AppMenuState> = OnceLock::new();
@@ -186,6 +193,7 @@ pub fn run() {
                 notifications_enabled: AtomicBool::new(false),
                 normal_responses_enabled: AtomicBool::new(true),
                 completion_display_enabled: AtomicBool::new(true),
+                web_ui_enabled: AtomicBool::new(true),
                 notification_turns: Mutex::new(HashSet::new()),
                 generation: AtomicU64::new(0),
             });
@@ -256,6 +264,9 @@ pub fn run() {
             set_pet_size,
             set_xangi_url,
             get_xangi_url,
+            get_connection_profiles,
+            upsert_connection_profile,
+            set_web_ui_enabled,
             clear_xangi_url,
             send_pet_message,
             set_notifications_enabled,
@@ -328,6 +339,122 @@ fn get_xangi_url() -> Option<String> {
     PULL_STATE
         .get()
         .and_then(|s| s.current_url.lock().ok().and_then(|g| g.clone()))
+}
+
+#[tauri::command]
+fn set_web_ui_enabled(enabled: bool) {
+    if let Some(state) = PULL_STATE.get() {
+        state.web_ui_enabled.store(enabled, Ordering::Relaxed);
+        refresh_tray(&state.app_handle);
+    }
+}
+
+fn connection_profiles_paths(
+    app: &AppHandle,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    let dir = app.path().app_config_dir().map_err(|err| err.to_string())?;
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    Ok((
+        dir.join("connection-profiles.json"),
+        dir.join("connection-profiles.lock"),
+    ))
+}
+
+fn read_connection_profiles_file(path: &std::path::Path) -> Result<Vec<Value>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut input = String::new();
+    fs::File::open(path)
+        .and_then(|mut file| file.read_to_string(&mut input))
+        .map_err(|err| err.to_string())?;
+    serde_json::from_str(&input).map_err(|err| err.to_string())
+}
+
+fn upsert_profile_value(profiles: &mut Vec<Value>, profile: Value, id: &str) {
+    if let Some(existing) = profiles
+        .iter_mut()
+        .find(|value| value.get("id").and_then(Value::as_str) == Some(id))
+    {
+        *existing = profile;
+    } else {
+        profiles.push(profile);
+    }
+}
+
+#[tauri::command]
+fn get_connection_profiles(app: AppHandle) -> Result<Vec<Value>, String> {
+    let (path, lock_path) = connection_profiles_paths(&app)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|err| err.to_string())?;
+    lock.lock_shared().map_err(|err| err.to_string())?;
+    let result = read_connection_profiles_file(&path);
+    let _ = lock.unlock();
+    result
+}
+
+#[tauri::command]
+fn upsert_connection_profile(app: AppHandle, profile: Value) -> Result<Vec<Value>, String> {
+    let id = profile
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "connection profile id is required".to_string())?
+        .to_string();
+    let (path, lock_path) = connection_profiles_paths(&app)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|err| err.to_string())?;
+    lock.lock_exclusive().map_err(|err| err.to_string())?;
+
+    let result = (|| {
+        let mut profiles = read_connection_profiles_file(&path)?;
+        upsert_profile_value(&mut profiles, profile, &id);
+        let output = serde_json::to_vec_pretty(&profiles).map_err(|err| err.to_string())?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|err| err.to_string())?;
+        file.write_all(&output).map_err(|err| err.to_string())?;
+        file.sync_all().map_err(|err| err.to_string())?;
+        Ok(profiles)
+    })();
+    let _ = lock.unlock();
+    result
+}
+
+#[cfg(test)]
+mod connection_profile_tests {
+    use super::upsert_profile_value;
+    use serde_json::json;
+
+    #[test]
+    fn adds_and_updates_profiles_without_losing_other_entries() {
+        let mut profiles = vec![json!({"id": "xangi-a", "url": "http://a"})];
+        upsert_profile_value(
+            &mut profiles,
+            json!({"id": "xangi-b", "url": "http://b"}),
+            "xangi-b",
+        );
+        upsert_profile_value(
+            &mut profiles,
+            json!({"id": "xangi-a", "url": "http://a-new"}),
+            "xangi-a",
+        );
+
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0]["url"], "http://a-new");
+        assert_eq!(profiles[1]["url"], "http://b");
+    }
 }
 
 /// Send a single text line to the upstream xangi's `POST /api/pet/inbox`.
@@ -716,10 +843,16 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wr
     let show = MenuItemBuilder::with_id("tray_show", "ペットを表示").build(app)?;
     let hide = MenuItemBuilder::with_id("tray_hide", "ペットを隠す").build(app)?;
     let talk = MenuItemBuilder::with_id("tray_talk", "xangiに話しかける…").build(app)?;
-    let open_chat =
-        MenuItemBuilder::with_id("tray_open_chat", "Web Chatをアプリで開く").build(app)?;
+    let web_ui_enabled = PULL_STATE
+        .get()
+        .map(|state| state.web_ui_enabled.load(Ordering::Relaxed))
+        .unwrap_or(true);
+    let open_chat = MenuItemBuilder::with_id("tray_open_chat", "Web Chatをアプリで開く")
+        .enabled(web_ui_enabled)
+        .build(app)?;
     let open_chat_browser =
         MenuItemBuilder::with_id("tray_open_chat_browser", "Web Chatをブラウザで開く")
+            .enabled(web_ui_enabled)
             .build(app)?;
     let preferences =
         MenuItemBuilder::with_id("tray_preferences", "xangi URLを設定…").build(app)?;
@@ -856,6 +989,13 @@ fn open_configured_web_chat(app: &AppHandle) -> Result<(), String> {
 }
 
 fn configured_xangi_url() -> Result<String, String> {
+    if PULL_STATE
+        .get()
+        .map(|state| !state.web_ui_enabled.load(Ordering::Relaxed))
+        .unwrap_or(false)
+    {
+        return Err("this connection profile has no Web UI".into());
+    }
     PULL_STATE
         .get()
         .and_then(|state| {
@@ -971,7 +1111,7 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
     let open_chat_browser =
         MenuItemBuilder::with_id("menu_open_chat_browser", "Web Chatをブラウザで開く")
             .build(app)?;
-    let prefs = MenuItemBuilder::with_id("menu_prefs", "Preferences (xangi URL)…")
+    let prefs = MenuItemBuilder::with_id("menu_prefs", "Preferences (xangi connection)…")
         .accelerator("CmdOrCtrl+,")
         .build(app)?;
     let normal_responses = CheckMenuItemBuilder::with_id("menu_normal_responses", "通常応答を表示")
@@ -1033,6 +1173,8 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
         notifications,
         normal_responses,
         completion_display,
+        open_chat,
+        open_chat_browser,
     });
 
     app.on_menu_event(|app, event| {
@@ -1046,22 +1188,28 @@ fn refresh_app_menu(_app: &AppHandle) {
     let Some(menu) = APP_MENU_STATE.get() else {
         return;
     };
-    let (connection, notifications_enabled, normal_responses_enabled, completion_display_enabled) =
-        PULL_STATE
-            .get()
-            .map(|state| {
-                (
-                    state
-                        .connection
-                        .lock()
-                        .map(|value| *value)
-                        .unwrap_or(AppConnectionState::Disconnected),
-                    state.notifications_enabled.load(Ordering::Relaxed),
-                    state.normal_responses_enabled.load(Ordering::Relaxed),
-                    state.completion_display_enabled.load(Ordering::Relaxed),
-                )
-            })
-            .unwrap_or((AppConnectionState::NotConfigured, false, true, true));
+    let (
+        connection,
+        notifications_enabled,
+        normal_responses_enabled,
+        completion_display_enabled,
+        web_ui_enabled,
+    ) = PULL_STATE
+        .get()
+        .map(|state| {
+            (
+                state
+                    .connection
+                    .lock()
+                    .map(|value| *value)
+                    .unwrap_or(AppConnectionState::Disconnected),
+                state.notifications_enabled.load(Ordering::Relaxed),
+                state.normal_responses_enabled.load(Ordering::Relaxed),
+                state.completion_display_enabled.load(Ordering::Relaxed),
+                state.web_ui_enabled.load(Ordering::Relaxed),
+            )
+        })
+        .unwrap_or((AppConnectionState::NotConfigured, false, true, true, true));
     let port = SERVER_URL
         .get()
         .and_then(|url| url.rsplit(':').next())
@@ -1086,6 +1234,12 @@ fn refresh_app_menu(_app: &AppHandle) {
         .set_checked(completion_display_enabled)
     {
         eprintln!("xangi-pets: failed to refresh completion display setting: {err}");
+    }
+    if let Err(err) = menu.open_chat.set_enabled(web_ui_enabled) {
+        eprintln!("xangi-pets: failed to refresh in-app Web Chat availability: {err}");
+    }
+    if let Err(err) = menu.open_chat_browser.set_enabled(web_ui_enabled) {
+        eprintln!("xangi-pets: failed to refresh browser Web Chat availability: {err}");
     }
 }
 
