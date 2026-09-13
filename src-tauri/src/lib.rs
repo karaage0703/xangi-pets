@@ -842,6 +842,8 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wr
     .build(app)?;
     let show = MenuItemBuilder::with_id("tray_show", "ペットを表示").build(app)?;
     let hide = MenuItemBuilder::with_id("tray_hide", "ペットを隠す").build(app)?;
+    let recenter =
+        MenuItemBuilder::with_id("tray_recenter", "ペットを画面中央に戻す").build(app)?;
     let talk = MenuItemBuilder::with_id("tray_talk", "xangiに話しかける…").build(app)?;
     let web_ui_enabled = PULL_STATE
         .get()
@@ -875,6 +877,7 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wr
             &PredefinedMenuItem::separator(app)?,
             &show,
             &hide,
+            &recenter,
             &talk,
             &open_chat,
             &open_chat_browser,
@@ -920,6 +923,7 @@ fn refresh_tray(app: &AppHandle) {
 fn handle_control_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
     match event.id().as_ref() {
         "tray_show" | "menu_show" => show_pet_window(app),
+        "tray_recenter" | "menu_recenter" => recenter_pet_window(app),
         "tray_hide" | "menu_hide" => {
             if let Some(window) = app.get_webview_window("pet") {
                 let _ = window.hide();
@@ -975,6 +979,15 @@ fn handle_control_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
 
 fn show_pet_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("pet") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn recenter_pet_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("pet") {
+        let _ = window.center();
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
@@ -1103,6 +1116,8 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
         .build(app)?;
     let show = MenuItemBuilder::with_id("menu_show", "ペットを表示").build(app)?;
     let hide = MenuItemBuilder::with_id("menu_hide", "ペットを隠す").build(app)?;
+    let recenter =
+        MenuItemBuilder::with_id("menu_recenter", "ペットを画面中央に戻す").build(app)?;
     let talk = MenuItemBuilder::with_id("menu_talk", "xangiに話しかける…")
         .accelerator("CmdOrCtrl+T")
         .build(app)?;
@@ -1138,6 +1153,7 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
         .item(&PredefinedMenuItem::separator(app)?)
         .item(&show)
         .item(&hide)
+        .item(&recenter)
         .item(&talk)
         .item(&open_chat)
         .item(&open_chat_browser)

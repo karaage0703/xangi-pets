@@ -6,7 +6,11 @@
 
 import { bubblePageLayout, makeBubbleUI, subscribeBubbles } from './lib/bubble.js';
 import { makeClickGateController } from './lib/click-gate.js';
-import { fitWindowSize } from './lib/window-layout.js';
+import {
+  centeredWindowPosition,
+  fitWindowSize,
+  isWindowPositionRecoverable,
+} from './lib/window-layout.js';
 import {
   findProfile,
   normalizeProfile,
@@ -193,9 +197,24 @@ async function restoreWindowPosition() {
   const y = Number(rawY);
   if (!Number.isFinite(x) || !Number.isFinite(y)) return;
   try {
-    const { getCurrentWindow } = await import('@tauri-apps/api/window');
+    const { availableMonitors, getCurrentWindow, primaryMonitor } = await import(
+      '@tauri-apps/api/window'
+    );
     const { PhysicalPosition } = await import('@tauri-apps/api/dpi');
-    await getCurrentWindow().setPosition(new PhysicalPosition(x, y));
+    const win = getCurrentWindow();
+    const size = await win.outerSize();
+    const monitors = await availableMonitors();
+    let target = { x, y };
+    if (!isWindowPositionRecoverable(target, size, monitors)) {
+      const fallbackMonitor = (await primaryMonitor()) ?? monitors[0];
+      target = centeredWindowPosition(size, fallbackMonitor) ?? target;
+      console.info(
+        `xangi-pets: saved window position (${x}, ${y}) is off-screen; recovering to (${target.x}, ${target.y})`,
+      );
+    }
+    await win.setPosition(new PhysicalPosition(target.x, target.y));
+    writeStorage('window-x', String(target.x));
+    writeStorage('window-y', String(target.y));
   } catch {
     // Browser dev mode or a platform that cannot restore an absolute position.
   }
