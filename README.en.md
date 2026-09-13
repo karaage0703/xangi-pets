@@ -6,76 +6,56 @@
 
 [日本語](README.md)
 
-A small always-on-top desktop pet for [xangi](https://github.com/karaage0703/xangi). It animates in a transparent window, follows xangi's activity state, and displays responses in speech bubbles without blocking clicks on the rest of your desktop.
+A desktop companion for [xangi](https://github.com/karaage0703/xangi). It animates in a transparent always-on-top window, follows xangi's activity, and displays responses in speech bubbles. Transparent space around the pet passes clicks through to the applications below.
 
-## Features
+## Key features
 
-- Animations for xangi's `idle`, `thinking`, `talking`, and `error` states
-- Speech bubbles for concurrent conversations
-- Long-message paging every four seconds, aligned to complete text lines
-- Send a message by clicking the pet or pressing `t`
-- A persistent menu-bar icon and a normal application menu with show/hide, talk, Web Chat, preferences, and quit actions
-- An in-app Web Chat window, with an option to use the default browser instead
-- Upstream connection status and the per-instance embedded-server port in both menus
-- Independent speech-bubble toggles for live responses and completion messages, including a completion-only mode
-- Optional macOS system notifications for newly started turns; no permission prompt on first launch
-- Five pet sizes and five bubble sizes
-- Codex `hatch-pet` compatible sprites and a bundled original `xangi` pet
-- A release bundle verified on macOS with Apple Silicon
+- Animate with xangi's `idle`, `thinking`, `talking`, and `error` states
+- Show concurrent conversations in speech bubbles and page through long responses
+- Send a message to xangi by clicking the pet or pressing `t`
+- Control visibility, connections, and notifications from the menu bar or application menu
+- Open xangi Web Chat inside the app or in the default browser
+- Toggle live responses, completion messages, and macOS system notifications independently
+- Scale the pet and speech bubble through five sizes each
+- Use multiple xangi connections and multiple pet processes
+- Load Codex `hatch-pet` compatible sprites or the bundled `xangi` pet
 
-## Quick start
+## Quickstart
 
-1. On a Mac with Apple Silicon, download the `.dmg` from [Releases](https://github.com/karaage0703/xangi-pets/releases).
-2. Install and launch it. See [Installation](docs/INSTALL.md) for unsigned-app warnings.
-3. Create a connection profile when prompted. Give it a name, enter the xangi event API URL, and specify whether that xangi instance provides a Web UI. The local default is `http://localhost:18888`.
+GitHub Releases currently provide a tested binary for macOS on Apple Silicon.
 
-For xangi on another machine, use an event API URL reachable over your LAN or Tailscale. Press `x` to choose an existing profile, update the active profile, add a new one, or disconnect the current pet. The shared profile list is stored in the Tauri app configuration so every pet process can see the same connections. Each pet window remembers its selected profile, while character, size, notifications, and screen position remain separated by profile.
+1. Download `xangi-pets_X.Y.Z_aarch64.dmg` from [Releases](https://github.com/karaage0703/xangi-pets/releases).
+2. Copy the app to `/Applications`, then Control-click it in Finder and choose **Open**.
+3. Add a connection when the app starts and enter the xangi URL. The default for xangi on the same Mac is `http://localhost:18888`.
 
-For a xangi instance without Web Chat, set `XANGI_EVENTS_SERVER_ENABLED=true` on xangi and turn off **Web UI available** in its xangi-pets profile. The pet remains fully usable, while menu items that would open Web Chat are disabled.
+For xangi on another machine, use a URL reachable over your LAN or Tailscale. xangi-pets can also connect to a headless xangi instance without its Web UI.
 
-## Menu bar and application menu
+See [Installation](docs/INSTALL.md) for first-launch details and the [Usage Guide](docs/en/usage.md) for connections and controls.
 
-The menu-bar icon remains available while the pet is hidden. The normal application menu exposes the same primary controls whenever xangi-pets is active, so it also provides access when macOS has hidden the status icon among other menu-bar apps.
+## Start using xangi-pets
 
-Both menus can show or hide the pet, open the existing talk dialog, open the configured xangi Web Chat URL in an in-app window or the default browser when available, change the connection profile, toggle notifications, show help, or quit.
+Click the pet or press `t` to send a message to xangi. Drag the pet to reposition it.
 
-“Connected” is shown only after the upstream SSE handshake succeeds. If xangi stops, the status changes to reconnecting and returns to connected automatically after recovery. Notifications are opt-in and only fire once for a completion or error belonging to a turn observed after notifications were enabled. Reconnected historical events are not notified. The first message sent from the pet lazily creates a new Web session dedicated to that xangi-pets process. Later messages in the same app run continue that session instead of joining the most recent browser or device session.
+The app stays available in the menu bar and provides these actions:
 
-Only configured `http://` and `https://` base URLs can be opened. URLs with user information are rejected, and query strings or fragments are removed before storage, display, or opening. On macOS, an App Transport Security exception is limited to embedded web content so WKWebView can display the HTTP endpoints commonly used on localhost, LANs, and Tailscale. The in-app Web Chat is remote content and is not included in the Tauri capability assigned to the pet frontend.
+- Show or hide the pet
+- Return the pet to the center of the display
+- Talk to xangi
+- Open Web Chat in the app or browser
+- Add, select, or edit a connection
+- Toggle speech bubbles and system notifications
+- Change the pet and bubble sizes
 
-## Supported release
+If automatic wandering, manual placement, or a monitor-layout change carries the pet off-screen, choose **Return Pet to Center** from the menu bar or application menu.
 
-GitHub Releases currently provide only the macOS Apple Silicon `.dmg`, which has been tested on real hardware. Windows x86_64 and Linux x86_64 packages are built in CI, but they have not been tested on real hardware and are not included in releases.
+See the [Usage Guide](docs/en/usage.md) for keyboard controls, multiple instances, custom pets, and troubleshooting.
 
-## Controls
+## Supported platforms
 
-| Key or action | Behavior |
-|---|---|
-| Click pet / `t` | Send a message to xangi |
-| Drag pet | Move the window |
-| `x` | Change the xangi URL |
-| `c` | Choose a pet |
-| `b` | Cycle bubble size |
-| `p` | Cycle pet size |
-| `h` / `?` | Toggle help |
-| Click bubble | Dismiss the bubble |
+- macOS Apple Silicon: tested on real hardware and distributed as a `.dmg` on GitHub Releases
+- Windows x86_64 / Linux x86_64: built in CI but not distributed because they have not been tested on real hardware
 
-Long responses show four complete lines per page. Paging starts after the response completes, advances every four seconds, visits the final page, and then loops to the beginning.
-
-## Custom pets
-
-The app includes the original `xangi` sample pet, so no asset setup is required. Personal character assets are not included in the public distribution. Custom Codex `hatch-pet` compatible assets can be placed in either location:
-
-```text
-~/.xangi/pets/<pet-name>/
-~/.codex/pets/<pet-name>/
-├── pet.json
-└── spritesheet.webp
-```
-
-The sprite sheet is a transparent 1536×1872 WebP atlas with 8 columns, 9 rows, and 192×208 cells.
-
-## Development
+## Develop from source
 
 Install Node.js 18 or later, stable Rust, and the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) for your OS.
 
@@ -85,21 +65,21 @@ npm test
 npm run tauri dev
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and [docs/EVENTS.md](docs/EVENTS.md) for the event protocol.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development and contribution workflow.
 
-## Architecture
+## Documentation
 
-```text
-xangi Web Chat
-  └─ GET /api/events/stream (SSE)
-       └─ xangi-pets embedded Rust server
-            ├─ state aggregation
-            ├─ speech-bubble events → pet webview
-            └─ configured xangi URL → in-app Web Chat window
-```
+- [Usage Guide](docs/en/usage.md) — connections, menus, keyboard controls, multiple instances, custom pets, and troubleshooting
+- [Installation](docs/INSTALL.md) — first launch on macOS, updates, and removal
+- [Design Document](docs/en/design.md) — architecture, components, data flow, and design decisions
+- [Event Protocol](docs/EVENTS.md) — xangi SSE events and the embedded API
+- [CONTRIBUTING.md](CONTRIBUTING.md) — development setup and contribution workflow
 
-The pet initiates the SSE connection. Multiple pets can connect without adding callback URLs to xangi.
+## Related projects
+
+- [xangi](https://github.com/karaage0703/xangi) — the main application for using AI agents from chat platforms and the Web UI
+- [openai/skills hatch-pet](https://github.com/openai/skills/tree/main/skills/.curated/hatch-pet) — the source of the compatible sprite format
 
 ## License
 
-Apache License 2.0. Distribution bundles include generated third-party license notices.
+Apache License 2.0. Distribution bundles include third-party license notices for bundled Rust crates and npm packages.
