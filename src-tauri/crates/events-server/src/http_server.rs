@@ -33,7 +33,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 use tokio_stream::StreamExt;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -260,12 +260,34 @@ async fn get_bubbles_sse(
 async fn get_state_sse(
     State(s): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
-    let rx = s.state_bus.subscribe();
-    let initial = vec![json!({
-        "state": s.store.aggregate_state(),
-        "ts": crate::events::now_ms(),
-    })];
-    sse_from_rx(rx, initial, |_| true)
+    let stream = state_updates(s).map(|value| {
+        Ok(SseEvent::default().data(serde_json::to_string(&value).unwrap_or_default()))
+    });
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(25))
+            .text("ping"),
+    )
+}
+
+fn state_updates(s: AppState) -> impl Stream<Item = Value> {
+    let events = BroadcastStream::new(s.state_bus.subscribe()).map(|_| ());
+    // The first tick supplies the snapshot. Subsequent ticks let the error
+    // expression expire even when upstream is silent. Dropping the SSE stream
+    // also drops its timer; no background task survives a disconnected client.
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let ticks = IntervalStream::new(interval).map(|_| ());
+    let mut previous = None;
+    events.merge(ticks).filter_map(move |_| {
+        // Recompute rather than replay queued states, including after lag.
+        let state = s.store.aggregate_state();
+        if previous == Some(state) {
+            return None;
+        }
+        previous = Some(state);
+        Some(json!({ "state": state, "ts": crate::events::now_ms() }))
+    })
 }
 
 async fn list_pets(State(s): State<AppState>) -> Json<Value> {
@@ -354,5 +376,71 @@ pub fn make_state_with_extra_pet_dirs(extra: Vec<PathBuf>) -> AppState {
         bubble_bus,
         state_bus,
         pet_dirs: Arc::new(pet_dirs_with_extra(&extra)),
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use futures::FutureExt;
+
+    #[tokio::test(start_paused = true)]
+    async fn state_stream_recovers_without_another_upstream_event() {
+        let state = make_state();
+        process_event(
+            &state,
+            json!({
+                "type": "agent.error", "thread_id": "failed", "turn_id": "turn",
+                "message": "failure",
+            }),
+        )
+        .unwrap();
+        let mut stream = Box::pin(state_updates(state.clone()));
+        assert_eq!(stream.next().await.unwrap()["state"], "error");
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(
+            stream.next().now_or_never().is_none(),
+            "unchanged states are not resent"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(stream.next().await.unwrap()["state"], "idle");
+        // Reconnecting must not restart the expression deadline.
+        let mut reconnected = Box::pin(state_updates(state.clone()));
+        assert_eq!(reconnected.next().await.unwrap()["state"], "idle");
+        drop(stream);
+        drop(reconnected);
+        assert_eq!(state.state_bus.receiver_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_activity_interrupts_error_and_expiry_keeps_activity() {
+        let state = make_state();
+        let mut stream = Box::pin(state_updates(state.clone()));
+        assert_eq!(stream.next().await.unwrap()["state"], "idle");
+        for (ty, thread, expected) in [
+            ("agent.error", "failed", "error"),
+            ("turn.started", "working", "thinking"),
+            ("message.delta", "working", "talking"),
+        ] {
+            process_event(
+                &state,
+                json!({
+                    "type": ty, "thread_id": thread, "turn_id": "turn",
+                    "message": "failure", "text": "hello",
+                }),
+            )
+            .unwrap();
+            assert_eq!(stream.next().await.unwrap()["state"], expected);
+        }
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(stream.next().now_or_never().is_none());
+        process_event(
+            &state,
+            json!({
+                "type": "turn.complete", "thread_id": "working", "turn_id": "turn",
+            }),
+        )
+        .unwrap();
+        assert_eq!(stream.next().await.unwrap()["state"], "idle");
     }
 }

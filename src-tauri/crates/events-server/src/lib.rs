@@ -4,9 +4,14 @@
 // Kept as a separate crate so it builds and tests cleanly on Linux without
 // pulling in Tauri's webview system dependencies.
 
+pub mod agents;
+pub mod display;
 pub mod events;
 pub mod http_server;
+pub mod instances;
 pub mod pet_inbox;
+pub mod session_filters;
+pub mod session_monitor;
 pub mod sse_client;
 pub mod thread_state;
 

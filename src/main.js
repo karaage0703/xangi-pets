@@ -1,3 +1,6 @@
+import { PET_SCALE_STEPS, createPetDisplayState } from './lib/pet-display.js';
+import { mountSessionFilterControls } from './lib/session-filter-controls.js';
+import { CELL_W, CELL_H, COLS, ROWS, ROW_NAMES, FPS, loadImage, makeRenderer } from './lib/pet-renderer.js';
 // xangi-pets renderer
 //
 // Asset and state come from xangi-pets-server (HTTP + SSE) when available.
@@ -16,12 +19,9 @@ import {
   normalizeProfile,
   parseProfiles,
   upsertProfile,
+  instanceGroups,
+  setInstanceEnabled,
 } from './lib/connection-profiles.js';
-
-const CELL_W = 192;
-const CELL_H = 208;
-const COLS = 8;
-const ROWS = 9;
 
 // Lower bound on the window width — even when a tiny pet + tiny bubble
 // would technically fit in less, keep at least this so picker overlays and
@@ -33,12 +33,6 @@ const BASE_WINDOW_W = 280;
 // case for shrinking bubbles is rare — most cycles are about making text
 // readable on a projected demo screen.
 const BUBBLE_SCALE_STEPS = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0];
-
-// Allowed pet-scale values cycled by the `p` key. 1.0 = baseline (= the size
-// you see at first launch). Numbers are user-visible multipliers; the actual
-// rendered pixel size is multiplied by PET_RENDER_FACTOR below to map the
-// hatch-pet 192×208 native sprite to the historic baked-in render size.
-const PET_SCALE_STEPS = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0];
 
 // User-visible 1.0x renders at half the native sprite cell. Keeps the first-
 // launch appearance identical to the historic 0.5 default while letting the
@@ -52,28 +46,7 @@ const BUBBLE_AREA_H_BASE = 96;
 const BUBBLE_MAX_W_BASE = 240; // matches .bubble's max-width in styles.css
 const WINDOW_HORIZONTAL_PADDING = 40;
 
-// Animation row layout: hatch-pet `references/animation-rows.md` convention.
-const ROW_NAMES = [
-  'idle',          // 0: neutral breathing/blink
-  'running-right', // 1
-  'running-left',  // 2
-  'waving',        // 3
-  'jumping',       // 4
-  'failed',        // 5
-  'waiting',       // 6
-  'running',       // 7
-  'review',        // 8: focused/thinking loop
-];
 
-// Map xangi state -> row name.
-const STATE_TO_ROW = {
-  idle: 'idle',
-  thinking: 'review',
-  talking: 'waving',
-  error: 'failed',
-};
-
-const FPS = 6;
 
 // Namespaced localStorage. Multiple xangi-pets processes (e.g. two `open -n`
 // instances) share the same WKWebView storage on macOS, so unprefixed keys
@@ -158,7 +131,8 @@ async function readConnectionProfiles() {
 async function writeConnectionProfile(profile) {
   try {
     return parseProfiles(JSON.stringify(await tauriInvoke('upsert_connection_profile', { profile })));
-  } catch {
+  } catch (error) {
+    if (globalThis.__TAURI_INTERNALS__) throw error;
     const profiles = upsertProfile(
       parseProfiles(globalThis.localStorage?.getItem(CONNECTION_PROFILES_KEY)),
       profile,
@@ -180,7 +154,12 @@ function activateProfile(profile) {
 }
 
 async function applyConnectionProfile(profile) {
-  const applied = await tauriInvoke('set_xangi_url', { url: profile.url });
+  const enabled = setInstanceEnabled(await readConnectionProfiles(), profile.id, true);
+  for (const value of enabled) {
+    if (value.url === profile.url) await writeConnectionProfile(value);
+  }
+  profile = { ...profile, enabled: true };
+  const applied = await tauriInvoke('set_xangi_url', { url: profile.url, agentId: profile.agentId || null });
   const normalized = { ...profile, url: typeof applied === 'string' ? applied : profile.url };
   activateProfile(normalized);
   await tauriInvoke('set_web_ui_enabled', { enabled: normalized.webUiEnabled }).catch((err) => {
@@ -272,10 +251,11 @@ async function ensureXangiUrl() {
   try {
     const cur = await tauriInvoke('get_xangi_url');
     if (typeof cur === 'string' && cur) {
-      const profile = profiles.find((value) => value.url === cur) ||
+      const assigned = findProfile(profiles, globalThis.localStorage?.getItem(assignedProfileKey()));
+      const profile = (assigned?.url === cur ? assigned : null) || profiles.find((value) => value.url === cur && !value.agentId) ||
         normalizeProfile({ name: new URL(cur).hostname || 'xangi', url: cur });
       profiles = await writeConnectionProfile(profile);
-      activateProfile(profile);
+      await applyConnectionProfile(profile);
       return cur;
     }
   } catch {
@@ -288,7 +268,8 @@ async function ensureXangiUrl() {
   // the first time a new slot is launched.
   const assignedId = globalThis.localStorage?.getItem(assignedProfileKey());
   const assigned = findProfile(profiles, assignedId);
-  const automatic = assigned || (profiles.length === 1 ? profiles[0] : null);
+  const assignedEnabled = assigned && (assigned.enabled !== false || instanceGroups(profiles).some((group) => group.url === assigned.url && group.enabled));
+  const automatic = (assignedEnabled ? assigned : null) || profiles.find((profile) => profile.enabled === true) || (profiles.length === 1 && profiles[0].enabled !== false ? profiles[0] : null);
   if (automatic) {
     try {
       const applied = await applyConnectionProfile(automatic);
@@ -354,14 +335,6 @@ async function resolveServerUrl() {
   }
   // Default fallback (browser dev mode, or Tauri command unavailable).
   return 'http://127.0.0.1:7895';
-}
-
-// No default name. The first time the user runs xangi-pets they pick from
-// whatever sprites are present in ~/.xangi/pets / ~/.codex/pets via the
-// in-window picker. The selection is persisted to localStorage afterwards.
-function readPetName() {
-  const fromStorage = readStorage('name');
-  return fromStorage && fromStorage.length > 0 ? fromStorage : null;
 }
 
 function readScale() {
@@ -496,6 +469,20 @@ async function loadFromServer(serverUrl, name) {
   return { meta, image, source: 'server' };
 }
 
+async function loadAgentPet() {
+  const { meta, image: bytes } = await tauriInvoke('get_agent_pet', {
+    directory: activeProfile.spriteDirectory,
+  });
+  const url = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: 'image/webp' }));
+  try {
+    const image = await loadImage(url);
+    if (image.width !== CELL_W * COLS || image.height !== CELL_H * ROWS) {
+      throw new Error('スプライトは1536×1872px（8列×9行）が必要です');
+    }
+    return { meta, image, source: 'Agent workspace' };
+  } finally { URL.revokeObjectURL(url); }
+}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
@@ -568,8 +555,7 @@ function showHelp() {
         <dl class="help-keys">
           <dt>x</dt><dd>xangi の URL を設定（pull 元の接続先）</dd>
           <dt>t</dt><dd>xangi にテキストを送信（ペットをクリックでも開く）</dd>
-          <dt>c</dt><dd>ペット（スプライト）を切り替え</dd>
-          <dt>p</dt><dd>ペットのサイズを循環</dd>
+          <dt>p</dt><dd>全ペットのサイズを循環（共通設定）</dd>
           <dt>b</dt><dd>ふきだしのサイズを循環</dd>
           <dt>1〜9</dt><dd>アニメ行を切り替え（開発用）</dd>
           <dt>h / ?</dt><dd>このヘルプを開く / 閉じる</dd>
@@ -630,6 +616,7 @@ function renderHelpState() {
   const body = document.getElementById('help-status-body');
   if (!body) return;
   const rows = [
+    helpRow('Agent', activeProfile?.agentId || '全Agent（従来設定）', ''),
     helpRow(
       'xangi URL',
       helpState.xangiUrl,
@@ -689,8 +676,7 @@ function showHelpOverlay(ctx) {
 //   { action: 'disconnect' }
 //   { action: 'cancel' }
 //
-// Same picker-overlay CSS as pickPet so the look stays
-// consistent. Esc/backdrop-click/Cancel button all resolve as 'cancel'.
+// Esc/backdrop-click/Cancel button all resolve as 'cancel'.
 async function pickXangiUrl(profiles, currentProfile, legacyUrl = '') {
   const initial = currentProfile?.url || legacyUrl || 'http://localhost:18888';
   const initialName = currentProfile?.name || '';
@@ -717,7 +703,7 @@ async function pickXangiUrl(profiles, currentProfile, legacyUrl = '') {
             .map(
               (profile) => `<button type="button" class="picker-item${profile.id === currentProfile?.id ? ' current' : ''}" data-profile-id="${escapeHtml(profile.id)}">
                 <span class="picker-main">${escapeHtml(profile.name)}</span>
-                <span class="picker-sub">${escapeHtml(profile.url)}${profile.webUiEnabled ? '' : ' · Web UIなし'}</span>
+                <span class="picker-sub">${escapeHtml(profile.url)}${profile.agentId ? ` · ${escapeHtml(profile.agentId)}` : ' · 全Agent'}${profile.webUiEnabled ? '' : ' · Web UIなし'}</span>
               </button>`,
             )
             .join('')}
@@ -725,9 +711,23 @@ async function pickXangiUrl(profiles, currentProfile, legacyUrl = '') {
             <span class="picker-main">＋ 新しい接続先を追加</span>
           </button>
         </div>
+        <fieldset class="instance-switches">
+          <legend>同時に見守るインスタンス</legend>
+          ${instanceGroups(profiles).map((group) => `<label class="xangi-profile-check"><input type="checkbox" data-instance-profile="${escapeHtml(group.profile.id)}" ${group.enabled ? 'checked' : ''} /><span>${escapeHtml(group.profile.name)}<small>${escapeHtml(group.url)}</small></span></label>`).join('')}
+        </fieldset>
+        <p class="picker-hint instance-status" role="status">ONの接続先を同時表示します。入力先は接続先ボタンで選べます。</p>
+        <div class="session-filter-controls"></div>
         <label class="xangi-profile-field"><span>名前</span><input type="text" class="xangi-profile-name" value="${escapeHtml(initialName)}" placeholder="xangi-a" autocomplete="off" /></label>
         <label class="xangi-profile-field"><span>イベントAPI</span>
         <input type="url" class="xangi-url-input" value="${escapeHtml(initial)}" placeholder="http://localhost:18888" spellcheck="false" autocomplete="off" />
+        </label>
+        <label class="xangi-profile-field"><span>Agent</span>
+          <select class="xangi-agent-select"><option value="">全Agentを見守る</option></select>
+          <button type="button" class="picker-btn ghost" data-action="load-agents">Agent一覧を取得</button>
+        </label>
+        <p class="picker-hint agent-status" role="status"></p>
+        <label class="xangi-profile-field"><span>Agentのスプライト配置先</span>
+          <input class="xangi-sprite-directory" value="${escapeHtml(currentProfile?.spriteDirectory || 'assets/xangi-pets')}" placeholder="assets/xangi-pets" />
         </label>
         <label class="xangi-profile-check"><input type="checkbox" class="xangi-web-ui-enabled" ${currentProfile?.webUiEnabled === false ? '' : 'checked'} /> Web UIも利用する</label>
         <div class="xangi-url-actions">
@@ -742,8 +742,48 @@ async function pickXangiUrl(profiles, currentProfile, legacyUrl = '') {
       </div>
     `;
     const input = overlay.querySelector('.xangi-url-input');
+    mountSessionFilterControls(overlay.querySelector('.session-filter-controls'), tauriInvoke);
     const nameInput = overlay.querySelector('.xangi-profile-name');
     const webUiInput = overlay.querySelector('.xangi-web-ui-enabled');
+    const agentInput = overlay.querySelector('.xangi-agent-select');
+    const directoryInput = overlay.querySelector('.xangi-sprite-directory');
+    const agentStatus = overlay.querySelector('.agent-status');
+    const instanceStatus = overlay.querySelector('.instance-status');
+    overlay.addEventListener('change', async (event) => {
+      const id = event.target?.dataset?.instanceProfile;
+      if (!id) return;
+      const input = event.target;
+      const requested = input.checked;
+      overlay.querySelectorAll('[data-instance-profile]').forEach((element) => { element.disabled = true; });
+      try {
+        const before = await readConnectionProfiles();
+        const next = setInstanceEnabled(before, id, requested);
+        for (const profile of next) {
+          if (profile.enabled !== findProfile(before, profile.id)?.enabled) await writeConnectionProfile(profile);
+        }
+        const primary = await tauriInvoke('sync_enabled_instances');
+        if (!primary && activeProfile?.url === findProfile(next, id)?.url) {
+          activeProfile = null;
+          globalThis.localStorage?.removeItem(assignedProfileKey());
+          writeXangiUrl('');
+        }
+        profiles = next;
+        instanceStatus.textContent = requested ? 'ONにしました。常駐ペットと実行中セッションを表示します。' : 'OFFにしました。他のインスタンスは見守りを続けます。';
+      } catch (error) {
+        input.checked = !requested;
+        instanceStatus.textContent = `切替に失敗しました: ${error}`;
+      } finally {
+        overlay.querySelectorAll('[data-instance-profile]').forEach((element) => { element.disabled = false; });
+      }
+    });
+    if (currentProfile?.agentId) {
+      agentInput.add(new Option(currentProfile.agentId, currentProfile.agentId));
+      agentInput.value = currentProfile.agentId;
+    }
+    input.addEventListener('input', () => {
+      agentInput.replaceChildren(new Option('全Agentを見守る', ''));
+      agentStatus.textContent = '接続先を変更しました。Agent一覧を取得してください。';
+    });
 
     let resolved = false;
     async function cleanup(result) {
@@ -753,6 +793,7 @@ async function pickXangiUrl(profiles, currentProfile, legacyUrl = '') {
       if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
       await popModalClickGate();
       await sizeRestore?.();
+      if (result.action === 'cancel') await tauriInvoke('hide_inactive_pet').catch(() => {});
       resolve(result);
     }
     function onKey(ev) {
@@ -769,12 +810,14 @@ async function pickXangiUrl(profiles, currentProfile, legacyUrl = '') {
           name: nameInput.value,
           url: input.value,
           webUiEnabled: webUiInput.checked,
+          agentId: agentInput.value,
+          spriteDirectory: directoryInput.value,
         });
         if (profile) cleanup({ action: 'connect', profile });
       }
     }
 
-    overlay.addEventListener('click', (ev) => {
+    overlay.addEventListener('click', async (ev) => {
       // Backdrop click closes
       if (ev.target === overlay) {
         cleanup({ action: 'cancel' });
@@ -782,7 +825,19 @@ async function pickXangiUrl(profiles, currentProfile, legacyUrl = '') {
       }
       const action = ev.target?.dataset?.action;
       const profileId = ev.target?.closest?.('[data-profile-id]')?.dataset?.profileId;
-      if (profileId) {
+      if (action === 'load-agents') {
+        const requestedUrl = input.value;
+        agentStatus.textContent = 'Agent一覧を取得中…';
+        try {
+          const { agents } = await tauriInvoke('list_xangi_agents', { url: requestedUrl });
+          if (resolved || input.value !== requestedUrl) return;
+          const selected = agentInput.value;
+          agentInput.replaceChildren(new Option('全Agentを見守る', ''));
+          for (const agent of agents) agentInput.add(new Option(agent.name || agent.id, agent.id));
+          agentInput.value = selected;
+          agentStatus.textContent = `${agents.length}件のAgent。接続先を分けて保存すると複数ペットで使えます。`;
+        } catch (err) { agentStatus.textContent = `Agent一覧の取得失敗: ${err}`; }
+      } else if (profileId) {
         const selected = findProfile(profiles, profileId);
         if (selected) cleanup({ action: 'connect', profile: selected });
       } else if (action === 'new-profile' || ev.target?.closest?.('[data-action="new-profile"]')) {
@@ -791,6 +846,8 @@ async function pickXangiUrl(profiles, currentProfile, legacyUrl = '') {
         nameInput.value = '';
         input.value = 'http://localhost:18888';
         webUiInput.checked = true;
+        agentInput.replaceChildren(new Option('全Agentを見守る', ''));
+        directoryInput.value = 'assets/xangi-pets';
         nameInput.focus();
       } else if (action === 'connect') {
         const profile = normalizeProfile({
@@ -798,6 +855,8 @@ async function pickXangiUrl(profiles, currentProfile, legacyUrl = '') {
           name: nameInput.value,
           url: input.value,
           webUiEnabled: webUiInput.checked,
+          agentId: agentInput.value,
+          spriteDirectory: directoryInput.value,
         });
         if (profile) cleanup({ action: 'connect', profile });
       }
@@ -869,6 +928,11 @@ async function runSetXangiUrlPrompt(bubbleUi) {
 
   if (result.action === 'disconnect') {
     try {
+      if (activeProfile) {
+        for (const profile of setInstanceEnabled(profiles, activeProfile.id, false)) {
+          if (profile.url === activeProfile.url) await writeConnectionProfile(profile);
+        }
+      }
       await tauriInvoke('clear_xangi_url');
     } catch (err) {
       console.warn(`clear_xangi_url failed: ${err}`);
@@ -880,6 +944,7 @@ async function runSetXangiUrlPrompt(bubbleUi) {
     await tauriInvoke('set_web_ui_enabled', { enabled: false }).catch(() => {});
     updateHelpState({ xangiUrl: null });
     bubbleUi?.showPreview?.('xangi 接続を解除しました');
+    await tauriInvoke('hide_inactive_pet').catch(() => {});
     return;
   }
 
@@ -894,6 +959,7 @@ async function runSetXangiUrlPrompt(bubbleUi) {
     updateHelpState({ xangiUrl: value });
     bubbleUi?.showPreview?.(`xangi URL: ${value}`);
     console.info(`xangi-pets: xangi URL -> ${value}`);
+    location.reload();
   } catch (err) {
     console.error(`xangi-pets: set_xangi_url failed: ${err}`);
     bubbleUi?.showPreview?.(`接続失敗: ${err}`);
@@ -999,62 +1065,6 @@ async function runPetMessagePrompt(bubbleUi) {
   }
 }
 
-// Fetch the list of available pets from the embedded server and let the
-// user click one. Resolves with the chosen name, or null if no pets exist.
-async function pickPet(serverUrl, currentName) {
-  const r = await fetch(`${serverUrl.replace(/\/$/, '')}/api/pet/list`);
-  if (!r.ok) throw new Error(`pet list HTTP ${r.status}`);
-  const { pets } = await r.json();
-  if (!Array.isArray(pets) || pets.length === 0) return null;
-
-  // Same window-grow + click-gate dance as pickXangiUrl. Without this the
-  // pet rows are click-through and selection is impossible.
-  const sizeRestore = await growWindowForModal(360, 380);
-  await pushModalClickGate();
-
-  return new Promise((resolve) => {
-    const overlay = document.createElement('div');
-    overlay.id = 'pet-picker';
-    overlay.innerHTML = `
-      <div class="picker-card">
-        <strong>Choose a pet</strong>
-        <p class="picker-hint">Click to select. Press <kbd>Esc</kbd> to cancel.</p>
-        <div class="picker-list"></div>
-      </div>
-    `;
-    const list = overlay.querySelector('.picker-list');
-    for (const name of pets) {
-      const btn = document.createElement('button');
-      btn.className = 'picker-item';
-      btn.textContent = name;
-      if (name === currentName) {
-        btn.classList.add('current');
-      }
-      btn.addEventListener('click', () => cleanup(name));
-      list.appendChild(btn);
-    }
-
-    function onKey(ev) {
-      if (ev.key === 'Escape') cleanup(null);
-    }
-    let resolved = false;
-    async function cleanup(chosen) {
-      if (resolved) return;
-      resolved = true;
-      window.removeEventListener('keydown', onKey, true);
-      if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
-      await popModalClickGate();
-      await sizeRestore?.();
-      resolve(chosen);
-    }
-    window.addEventListener('keydown', onKey, true);
-    document.body.appendChild(overlay);
-  });
-}
-
-// Show a small in-window hint explaining where to drop the pet sprite.
-// Triggered when /api/pet/asset/<name>/{pet.json,spritesheet.webp} can't be
-// loaded from the embedded server (i.e. user hasn't set up assets yet).
 function showSetupHint(serverUrl, petName, err) {
   const stage = document.getElementById('stage');
   if (!stage) return;
@@ -1067,124 +1077,15 @@ function showSetupHint(serverUrl, petName, err) {
   hint.id = 'setup-hint';
   hint.innerHTML = `
     <strong>No pet sprite for "${petName}"</strong>
-    <p>Place <code>pet.json</code> + <code>spritesheet.webp</code> at one of:</p>
-    <pre>~/.xangi/pets/${petName}/
-~/.codex/pets/${petName}/</pre>
+    <p>Agentのworkspaceに画像を配置し、接続先のAgentを確認してください。</p>
+    <pre>assets/xangi-pets/pet.json
+assets/xangi-pets/spritesheet.webp</pre>
     <p>See <a href="https://github.com/karaage0703/xangi-pets#セットアップ" target="_blank">README</a> for the sprite-sheet spec.</p>
     <p class="muted">server: ${serverUrl}</p>
   `;
   stage.appendChild(hint);
   document.title = `xangi-pets · setup needed`;
   console.error('xangi-pets setup hint:', err);
-}
-
-function loadImage(src) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    // The embedded server runs on a different port (7895) than the Vite dev
-    // server (1420), so the spritesheet is cross-origin. Without this flag
-    // the canvas becomes "tainted" and detectFilledFrames' getImageData()
-    // throws SecurityError. The server returns Access-Control-Allow-Origin:*
-    // so anonymous CORS is enough.
-    img.crossOrigin = 'anonymous';
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error(`image load failed: ${src}`));
-    img.src = src;
-  });
-}
-
-// hatch-pet leaves trailing cells fully transparent for rows that need fewer
-// than 8 frames. Walk the spritesheet at load and remember which columns are
-// actually filled per row, otherwise the loop draws blank cells and flickers.
-function detectFilledFrames(image) {
-  const off = document.createElement('canvas');
-  off.width = image.width;
-  off.height = image.height;
-  const ctx = off.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(image, 0, 0);
-
-  const out = [];
-  for (let r = 0; r < ROWS; r++) {
-    const filled = [];
-    for (let c = 0; c < COLS; c++) {
-      const { data } = ctx.getImageData(c * CELL_W, r * CELL_H, CELL_W, CELL_H);
-      for (let i = 3; i < data.length; i += 4) {
-        if (data[i] > 5) {
-          filled.push(c);
-          break;
-        }
-      }
-    }
-    out.push(filled.length > 0 ? filled : [0]);
-  }
-  return out;
-}
-
-function makeRenderer(canvas, image, drawW, drawH) {
-  let _drawW = drawW;
-  let _drawH = drawH;
-  canvas.width = _drawW;
-  canvas.height = _drawH;
-  const ctx = canvas.getContext('2d');
-  ctx.imageSmoothingEnabled = false;
-
-  const filledFrames = detectFilledFrames(image);
-  let row = 0;
-  let step = 0;
-  // Last xangi state we were told about. The wandering loop checks this so
-  // it only animates while the pet is genuinely idle (not while xangi is
-  // thinking/talking/erroring).
-  let currentState = 'idle';
-
-  function currentColumn() {
-    const cols = filledFrames[row];
-    return cols[step % cols.length];
-  }
-
-  function draw() {
-    ctx.clearRect(0, 0, _drawW, _drawH);
-    const sx = currentColumn() * CELL_W;
-    const sy = row * CELL_H;
-    ctx.drawImage(image, sx, sy, CELL_W, CELL_H, 0, 0, _drawW, _drawH);
-  }
-
-  // In-place sprite resize. Setting canvas.width/height resets the 2d context
-  // (image-smoothing flips back to default true), so reapply that and redraw.
-  // detectFilledFrames runs against the *source image* not the display canvas,
-  // so its result stays valid across resize — no need to recompute.
-  function setSize(w, h) {
-    _drawW = w;
-    _drawH = h;
-    canvas.width = w;
-    canvas.height = h;
-    ctx.imageSmoothingEnabled = false;
-    draw();
-  }
-
-  function setRow(name) {
-    const idx = ROW_NAMES.indexOf(name);
-    if (idx >= 0 && idx < ROWS) {
-      row = idx;
-      step = 0;
-    }
-  }
-
-  function setState(state) {
-    currentState = state;
-    const rowName = STATE_TO_ROW[state] ?? 'idle';
-    setRow(rowName);
-  }
-
-  function getState() {
-    return currentState;
-  }
-
-  function tick() {
-    step += 1;
-    draw();
-  }
-
-  return { draw, tick, setRow, setState, getState, setSize };
 }
 
 // Idle wandering: every few seconds, with some probability, nudge the
@@ -1342,7 +1243,12 @@ async function main() {
 
   // Sprite scale and bubble scale are mutable at runtime via the `p` and `b`
   // keys, so keep them in `let` bindings the keydown handler can mutate.
-  let spriteScale = readScale();
+  let initialDisplay = await tauriInvoke('get_pet_display').catch(() => null);
+  if (!initialDisplay?.persisted) {
+    const legacy = readScale();
+    initialDisplay = await tauriInvoke('set_pet_scale', { scale: PET_SCALE_STEPS.includes(legacy) ? legacy : 1 }).catch(() => ({ scale: 1, revision: 0 }));
+  }
+  let spriteScale = initialDisplay?.scale || 1;
   let bubbleScale = readBubbleScale();
   let drawW = petPixelW(spriteScale);
   let drawH = petPixelH(spriteScale);
@@ -1352,31 +1258,16 @@ async function main() {
   // bubbles arrive.
   await applyWindowSize(spriteScale, bubbleScale);
 
-  // Resolve which pet to show. localStorage wins; otherwise prompt the
-  // user with the picker. If they have no sprites at all, fall through
-  // to the setup hint.
-  let petName = readPetName();
-  if (!petName) {
-    try {
-      petName = await pickPet(serverUrl, null);
-    } catch (err) {
-      console.warn('xangi-pets: pet list failed', err);
-    }
-    if (!petName) {
-      showSetupHint(serverUrl, '?', new Error('no pets configured'));
-      return;
-    }
-    writeStorage('name', petName);
-  }
-
+  // Agent identity selects artwork, including the default Agent in legacy mode.
+  let petName = activeProfile?.agentId || 'xangi:default';
   let pet;
-  try {
-    pet = await loadFromServer(serverUrl, petName);
-  } catch (err) {
-    console.warn('xangi-pets: sprite load failed', err);
-    showSetupHint(serverUrl, petName, err);
-    return;
+  let workspaceError = null;
+  if (activeProfile) {
+    try { pet = await loadAgentPet(); petName = pet.meta.displayName || pet.meta.id || petName; }
+    catch (error) { workspaceError = error; }
   }
+  try { pet ||= await loadFromServer(serverUrl, 'xangi'); }
+  catch (error) { showSetupHint(serverUrl, petName, error); return; }
 
   document.title = `xangi-pets · ${pet.meta.displayName ?? pet.meta.id ?? petName} (${pet.source})`;
 
@@ -1417,6 +1308,7 @@ async function main() {
 
   subscribeBubbles(serverUrl, bubbleUi);
   window.__bubble = bubbleUi;
+  if (workspaceError) bubbleUi.showPreview(`Agent画像を取得できません: ${workspaceError}（ローカル画像を使用）`);
 
   // Bubble text grows while SSE deltas stream in, and dismiss/eviction shrinks
   // the stack. Follow the rendered stage in both directions.
@@ -1488,6 +1380,9 @@ async function main() {
   await tauriListen('pet://connection-status', ({ payload }) => {
     updateHelpState({ connection: String(payload ?? 'disconnected') });
   });
+  await tauriListen('pet://session-window-error', ({ payload }) => {
+    bubbleUi.showPreview(`セッションのペットを開けません: ${payload}`);
+  });
   await tauriListen('pet://notifications-changed', ({ payload }) => {
     const enabled = payload === true;
     writeStorage('notifications', enabled ? '1' : '0');
@@ -1507,19 +1402,16 @@ async function main() {
   });
   const connection = await tauriInvoke('get_connection_status').catch(() => 'not-configured');
   updateHelpState({ connection: String(connection ?? 'not-configured') });
-  await tauriListen('pet://reset-pet', async () => {
-    let chosen;
-    try {
-      chosen = await pickPet(serverUrl, petName);
-    } catch (err) {
-      console.warn('xangi-pets: pet list failed', err);
-      return;
-    }
-    if (chosen && chosen !== petName) {
-      writeStorage('name', chosen);
-      location.reload();
-    }
+  let scaleWork = Promise.resolve();
+  const sharedDisplay = createPetDisplayState(initialDisplay, (scale) => {
+    spriteScale = scale;
+    drawW = petPixelW(scale); drawH = petPixelH(scale);
+    renderer.setSize(drawW, drawH);
+    scaleWork = scaleWork.then(() => applyWindowSize(spriteScale, bubbleScale));
+    updateHelpState(helpContext());
   });
+  await tauriListen('pet://scale-changed', ({ payload }) => sharedDisplay.apply(payload));
+  sharedDisplay.apply(await tauriInvoke('get_pet_display').catch(() => initialDisplay));
 
   // First-launch: auto-show help once the user has settled (xangi URL prompt
   // dismissed, pet sprite loaded). showHelp() persists HELP_SHOWN_KEY itself
@@ -1528,8 +1420,8 @@ async function main() {
     showHelpOverlay(helpContext());
   }
 
-  // 1-9: cycle animation row (dev). x: set xangi (upstream) URL. c: change
-  // pet. b: cycle bubble scale. p: cycle pet (sprite) scale. h / ?: toggle
+  // 1-9: cycle animation row (dev). x: set xangi (upstream) URL.
+  // b: cycle bubble scale. p: cycle the shared pet scale. h / ?: toggle
   // help. t: talk to xangi. The old `s` key (override the embedded server
   // URL) was removed — it's a dev-only knob and the option confused end
   // users who thought they had to set two URLs. Use the XANGI_PET_PORT /
@@ -1554,19 +1446,6 @@ async function main() {
       renderer.setRow(ROW_NAMES[n - 1]);
       return;
     }
-    if (ev.key === 'c') {
-      let chosen;
-      try {
-        chosen = await pickPet(serverUrl, petName);
-      } catch (err) {
-        console.warn('xangi-pets: pet list failed', err);
-        return;
-      }
-      if (chosen && chosen !== petName) {
-        writeStorage('name', chosen);
-        location.reload();
-      }
-    }
     if (ev.key === 'b') {
       // Cycle through preset bubble sizes in-place. Window resize + CSS var
       // are applied immediately; existing bubbles stay on screen.
@@ -1583,19 +1462,11 @@ async function main() {
       console.info(`xangi-pets: bubble-scale -> ${next}`);
     }
     if (ev.key === 'p') {
-      // Cycle through preset pet (sprite) sizes in-place. We resize the
-      // canvas + Tauri window rather than reloading; existing bubbles and
-      // SSE streams keep running.
-      const idx = PET_SCALE_STEPS.findIndex((s) => Math.abs(s - spriteScale) < 0.01);
-      const next = PET_SCALE_STEPS[(idx + 1) % PET_SCALE_STEPS.length];
-      spriteScale = next;
-      drawW = petPixelW(next);
-      drawH = petPixelH(next);
-      writeStorage('scale', String(next));
-      renderer.setSize(drawW, drawH);
-      await applyWindowSize(next, bubbleScale);
-      bubbleUi.showPreview(`プレビュー: ペット ${next}x`);
-      console.info(`xangi-pets: pet-scale -> ${next}`);
+      try {
+        sharedDisplay.apply(await tauriInvoke('cycle_pet_scale'));
+        await scaleWork;
+        bubbleUi.showPreview(`全ペット ${spriteScale}x`);
+      } catch (error) { bubbleUi.showPreview(`サイズ変更に失敗しました: ${error}`); }
     }
     if (ev.key === 'x') {
       await runSetXangiUrlPrompt(bubbleUi);
@@ -1631,6 +1502,9 @@ async function main() {
   window.__pet = renderer;
 }
 
-main().catch((err) => {
+const start = new URLSearchParams(location.search).get('sessionPet') === '1'
+  ? import('./session-pet.js').then(({ startSessionPet }) => startSessionPet())
+  : main();
+start.catch((err) => {
   console.error('xangi-pets failed to start:', err);
 });

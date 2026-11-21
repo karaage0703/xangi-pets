@@ -1,114 +1,89 @@
-# Event Schema
+# イベント仕様
 
-xangi-events サーバが扱うイベントの形式。[xangiの外部イベントストリーム](https://github.com/karaage0703/xangi/blob/main/docs/events.md)のスキーマv2に追従する。
-状態ラベル (`thinking` / `talking` / `idle`) は wire には流さず、consumer 側で派生する。
+xangi-petsはxangiの`GET /api/events/stream`をSSEで購読します。Rustがイベントを集約し、ペットUIへ状態と吹き出しを配信します。
 
-> 実装は **Tauri アプリ (`xangi-pets`) に内蔵された axum サーバ**。
-> 起動: `npm run tauri dev` または配布バイナリの実行で自動的に
-> `0.0.0.0:7895` で listen する。`XANGI_PET_PORT` / `XANGI_PET_BIND` で変更可。
+## 会話イベント（スキーマv2）
 
-## Common fields
+共通フィールド:
 
-| field | type | notes |
+| フィールド | 型 | 内容 |
 |---|---|---|
-| `type` | string | 下記の event types のいずれか。必須 |
-| `thread_id` | string | 並列会話の識別子。プラットフォーム不問の opaque 文字列（`discord:<channel_id>` / `slack:<channel_id>` / `web:<session_id>` 等）。必須 |
-| `thread_label` | string | 任意。バブル UI に表示する人間可読名（例 Discord チャンネル名 `"#general"`）。送られなければ短縮した `thread_id` で代替 |
-| `turn_id` | string | 1 ターン = ユーザーメッセージ→応答完了。**全イベントで必須** |
-| `ts` | number | 送信側 epoch ms。省略時はサーバが現在時刻を入れる |
+| `type` | string | イベント種別。必須 |
+| `thread_id` | string | 会話の識別子。必須。例: `discord:<channel_id>`、`web:<session_id>` |
+| `turn_id` | string | ユーザー入力から応答終了までの識別子。必須 |
+| `thread_label` | string | 吹き出しに表示する会話名。省略時は短縮した`thread_id` |
+| `ts` | number | 送信時刻（epoch ms）。省略時は受信側で補完 |
+| `agent_id` | string | Agent識別子。指定時はAgent別の絞り込みに使用 |
 
-サーバは受信時に `recv_ts` (number, epoch ms) を付与してから再配信する。
+受信時刻は`recv_ts`（epoch ms）として付与します。
 
-## Event types (v2)
-
-| type | trigger | extra fields |
+| `type` | 内容 | 追加フィールド |
 |---|---|---|
-| `turn.started` | ユーザーメッセージ受信時 | `user_text` (任意) |
-| `message.delta` | 応答ストリームのデルタ毎 | `text` (必須), `full_text` (任意) |
-| `turn.complete` | ターン正常終了 | `text` (最終応答, 任意) |
-| `turn.aborted` | ユーザー操作で cancel | — |
-| `agent.error` | 例外発生 | `message` (必須) |
+| `turn.started` | 応答開始 | `user_text`（任意） |
+| `message.delta` | 応答の差分 | `text`（必須）、`full_text`（任意） |
+| `turn.complete` | 正常終了 | `text`（最終応答、任意） |
+| `turn.aborted` | 中断 | なし |
+| `agent.error` | エラー | `message`（必須） |
 
-> 旧スキーマで存在した `agent.thinking` / `agent.talking` / `agent.idle` は v2 で削除。
-> consumer 側で派生する：
-> - `turn.started` 受信後 `message.delta` まだなし → "thinking"
-> - `message.delta` が 1 回でも来た → "talking"
-> - `turn.complete` または `turn.aborted` 受信後 → "idle"
-> - `agent.error` 受信後 → "error"
-
-## 典型シーケンス
-
-正常完了：
 ```jsonl
-{"type":"turn.started",  "thread_id":"discord:T","turn_id":"u1"}
-{"type":"message.delta", "thread_id":"discord:T","turn_id":"u1","text":"そうそう。"}
-{"type":"message.delta", "thread_id":"discord:T","turn_id":"u1","text":"かなり実用的"}
-{"type":"turn.complete", "thread_id":"discord:T","turn_id":"u1","text":"そうそう。かなり実用的"}
+{"type":"turn.started","thread_id":"web:example","turn_id":"turn-1"}
+{"type":"message.delta","thread_id":"web:example","turn_id":"turn-1","text":"こんにちは。"}
+{"type":"turn.complete","thread_id":"web:example","turn_id":"turn-1","text":"こんにちは。"}
 ```
 
-cancel：
-```jsonl
-{"type":"turn.started",  "thread_id":"discord:T","turn_id":"u2"}
-{"type":"message.delta", "thread_id":"discord:T","turn_id":"u2","text":"途中まで…"}
-{"type":"turn.aborted",  "thread_id":"discord:T","turn_id":"u2"}
-```
+状態は受信側で導出します。開始後は`thinking`、差分受信後は`talking`、完了・中断後は`idle`、エラー後は`error`です。
 
-エラー：
-```jsonl
-{"type":"turn.started", "thread_id":"discord:T","turn_id":"u3"}
-{"type":"agent.error",  "thread_id":"discord:T","turn_id":"u3","message":"timeout"}
-```
+## 集約と通知
 
-並列に別チャンネルで会話が走っていれば、`thread_id` を分けて同時に流せる。
-サーバ側は thread ごとに状態を集約する。
+- threadごとに開く吹き出しは一つです。開始を受信していない差分でも吹き出しを開きます。
+- 差分の`text`を追記し、完了時の`text`を最終応答にします。中断時は受信済みテキストを残します。
+- Agent選択時は集約前に`agent_id`を比較し、ない場合はセッションAPIで会話の所有Agentを確認します。照合不能のターンは表示しません。Agent未選択は全体を購読します。
+- 接続解除・切替時は`bubble.reset`で吹き出しを消し、状態を`idle`に戻します。切断時は指数backoffで再接続します。
+- macOS通知は、有効化後かつ現在の接続で開始を観測したターンの完了・エラーに1回だけ出します。中断や再接続時の過去イベントには出しません。
 
-## Endpoints
+## セッション監視
 
-イベントは pet → xangi の pull 型 SSE で取得する。pet 側の embedded HTTP
-サーバは下記の集約済みエンドポイントだけを公開する（`POST /events` /
-`GET /events` の生イベント受信路は廃止済）。
+ONの接続先ごとに`GET /api/sessions/stream?mode=changes`を購読します。
 
-### Pull source (xangi 側)
+- `sessions`: セッション一覧を全件置換
+- `session_changes`: `upsert`を追加・更新し、`removed`のIDを削除
+- `activity_snapshot`: 対象threadの実行状態を更新
 
-Pet は xangi の `GET /api/events/stream` (SSE) を購読する。詳細は
-[xangiの `docs/events.md`](https://github.com/karaage0703/xangi/blob/main/docs/events.md) を参照。
+表示種類はpets側の`session-filters.json`に`chat` / `web` / `scheduler`の配列で保存します。初期値は`["chat","web"]`で、自動実行はOFFです。空配列も有効です。変更は全接続先へ即時反映し、再起動後も保持します。
 
-Tauri側はSSE handshake成功時だけ接続済みとする。stream切断または接続エラー後は再接続中とし、指数backoffで自動再接続する。
+`scope=scheduler`または`executionOrigin=automation`は自動実行、その他の`platform=web`はWeb、それ以外はChatに分類します。`isActive=true`かつ`lifecycle!=closed`で、選択した種類に一致するセッションを表示します。非表示の行も保持し、フィルタ変更時に再評価します。
 
-macOS通知を有効にした場合は、通知有効後かつ現在の接続中に `turn.started` を観測したturnだけを追跡する。そのturnの `turn.complete` または `agent.error` を最初に受信したときだけ通知する。再接続時に追跡中turnを破棄するため、過去イベントや終端イベント単独では通知しない。`turn.aborted` も通知しない。
+通信断だけではウィンドウを閉じず、再接続時の一覧で同期します。常駐ペットはフィルタの対象外です。
 
-ペットからの送信では、xangi-petsの各プロセスが最初の送信時に `POST /api/sessions` で専用Webセッションを作り、そのIDを `POST /api/pet/inbox` の `appSessionId` に必ず指定する。同じ起動中はそのセッションを継続し、xangi再起動などでセッションが見つからない場合だけ新規作成して1回再送する。`appSessionId`省略時に最新Webセッションを再利用するxangiの後方互換動作には依存しない。
+## ペットからの送信
 
-### `GET /api/pet/bubbles` (SSE)
+初回送信時に`POST /api/sessions`でプロセス専用のWebセッションを作り、`POST /api/pet/inbox`に`appSessionId`を指定します。Agent選択時はセッション作成に`agentId`も渡します。セッションが見つからない場合は作成し直して1回再送します。
 
-ペット UI 向けの **集約済み** ストリーム。クライアントは event 解釈不要で描画できる。
+## 内蔵HTTP API
 
-| sub-type | fields | 意味 |
+アプリ起動時にaxumサーバを起動します。既定は`0.0.0.0:7895`で、使用中なら後続ポートを試します。`XANGI_PET_BIND`と`XANGI_PET_PORT`で変更でき、実際のポートはメニューに表示します。
+
+| エンドポイント | 内容 |
+|---|---|
+| `GET /health` | 接続診断用の状態 |
+| `GET /api/pet/state` | 集約状態のSSE |
+| `GET /api/pet/bubbles` | 吹き出しのSSE |
+| `GET /api/pet/list` | 内蔵サーバの画像一覧 |
+| `GET /api/pet/asset/:name/:file` | 内蔵サーバの画像取得 |
+
+吹き出しイベント:
+
+| `type` | 主なフィールド | 内容 |
 |---|---|---|
-| `bubble.snapshot` | `thread_id`, `turn_id`, `text` | 接続時、現在 open 中の bubble |
-| `bubble.open` | `thread_id`, `turn_id` | 新規 bubble |
-| `bubble.delta` | `thread_id`, `turn_id`, `text` | text を **追記** する差分 |
-| `bubble.close` | `thread_id`, `turn_id`, `last_message`, `aborted?` | bubble を閉じる。`turn.aborted` 由来なら `aborted: true` |
+| `bubble.snapshot` | `thread_id`, `turn_id`, `text` | 接続時の開いている吹き出し |
+| `bubble.open` | `thread_id`, `turn_id` | 吹き出しを開く |
+| `bubble.delta` | `thread_id`, `turn_id`, `text` | テキストを追記 |
+| `bubble.close` | `thread_id`, `turn_id`, `last_message`, `aborted?` | 完了・中断 |
 | `bubble.error` | `thread_id`, `turn_id`, `message` | エラー表示 |
+| `bubble.reset` | なし | 吹き出しを全消去 |
 
-### `GET /api/pet/state` (SSE)
+内蔵APIに認証はありません。イベント表示はbest-effortで、順序の保証や失敗時の再送は行いません。
 
-サーバ側で thread store から派生した単一の集約状態（`idle`/`thinking`/`talking`/`error`）。
-スプライト行切替などペット表情の用途。
+## ペット表情のエラー期限
 
-## サーバ側の thread 集約ルール
-
-- `turn.started` で bubble open、状態 → "thinking"
-- `message.delta` で text 連結、状態 → "talking"
-  - `turn.started` を受け取ってない turn_id でも、デルタが来たら implicit に open（dropped data 回避）
-- `turn.complete` で bubble close、`text`（または旧式の `last_message`）を最終テキストに、状態 → "idle"
-- `turn.aborted` で bubble close、それまで貯めた text を `last_message` に、`aborted: true` 付与、状態 → "idle"
-- `agent.error` で bubble.error、状態 → "error"
-- 一度に open できる bubble は thread_id ごとに 1 つだけ
-
-## 注意
-
-- イベントは順序保証なし。送信側が時系列で投げる責任を負う
-- 失敗時の再送なし。Pet 表示は best-effort
-- 認証なし。Tailscale 内 / localhost 想定
-- 接続先URLは `http` / `https` のみ。userinfoを拒否し、query / fragmentを除去してbase URLとして扱う
+ペット全体の表情は `talking` → `thinking` → 直近30秒の `error` → `idle` の順で選びます。エラーの期限は受信時の単調時計で測り、診断状態や吹き出しは保持します。状態SSEはイベント受信時と1秒ごとに再評価し、表情が変わったときだけ配信します。

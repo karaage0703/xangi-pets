@@ -25,7 +25,10 @@ struct PetInboxRequest<'a> {
 }
 
 #[derive(Debug, Serialize)]
-struct CreateSessionRequest {}
+struct CreateSessionRequest<'a> {
+    #[serde(rename = "agentId", skip_serializing_if = "Option::is_none")]
+    agent_id: Option<&'a str>,
+}
 
 #[derive(Debug, Deserialize)]
 struct CreateSessionResponse {
@@ -75,13 +78,21 @@ pub async fn create_pet_session(
     base_url: &str,
     token: Option<&str>,
 ) -> Result<String, PetInboxError> {
+    create_agent_pet_session(base_url, token, None).await
+}
+
+pub async fn create_agent_pet_session(
+    base_url: &str,
+    token: Option<&str>,
+    agent_id: Option<&str>,
+) -> Result<String, PetInboxError> {
     let trimmed_url = base_url.trim().trim_end_matches('/');
     if trimmed_url.is_empty() {
         return Err(PetInboxError::EmptyUrl);
     }
     let url = format!("{trimmed_url}/api/sessions");
     let client = client()?;
-    let mut req = client.post(&url).json(&CreateSessionRequest {});
+    let mut req = client.post(&url).json(&CreateSessionRequest { agent_id });
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
@@ -234,6 +245,13 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PetInboxError::EmptyText));
+    }
+
+    #[test]
+    fn agent_session_request_keeps_the_agent_selection() {
+        let body = serde_json::to_value(CreateSessionRequest { agent_id: Some("agent-a") }).unwrap();
+        assert_eq!(body["agentId"], "agent-a");
+        assert_eq!(serde_json::to_value(CreateSessionRequest { agent_id: None }).unwrap(), json!({}));
     }
 
     #[test]

@@ -7,8 +7,12 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Duration;
+use tokio::time::Instant;
 
 use crate::events::now_ms;
+
+const ERROR_EXPRESSION_DURATION: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct Bubble {
@@ -28,6 +32,8 @@ pub struct Thread {
     /// alongside an event, so renames eventually catch up.
     pub label: Option<String>,
     pub bubble: Option<Bubble>,
+    // Local monotonic time: publisher timestamps may use a different clock.
+    error_until: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -36,6 +42,9 @@ pub struct ThreadStore {
 }
 
 impl ThreadStore {
+    pub fn clear(&self) {
+        self.inner.lock().unwrap().clear();
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -69,18 +78,20 @@ impl ThreadStore {
         let mut saw_thinking = false;
         for t in map.values() {
             match t.state.as_str() {
-                "error" => saw_error = true,
+                "error" => {
+                    saw_error |= t.error_until.is_some_and(|until| Instant::now() < until);
+                }
                 "talking" => saw_talking = true,
                 "thinking" => saw_thinking = true,
                 _ => {}
             }
         }
-        if saw_error {
-            "error"
-        } else if saw_talking {
+        if saw_talking {
             "talking"
         } else if saw_thinking {
             "thinking"
+        } else if saw_error {
+            "error"
         } else {
             "idle"
         }
@@ -111,6 +122,7 @@ impl ThreadStore {
             state: "idle".to_string(),
             label: None,
             bubble: None,
+            error_until: None,
         });
         // Update the label whenever the publisher sends one. Channel renames
         // (or first-time discovery) catch up on the next event.
@@ -226,6 +238,7 @@ impl ThreadStore {
             "agent.error" => {
                 let msg = e.get("message").and_then(|v| v.as_str()).unwrap_or("");
                 t.state = "error".to_string();
+                t.error_until = Some(Instant::now() + ERROR_EXPRESSION_DURATION);
                 out.push(json!({
                     "type": "bubble.error",
                     "thread_id": thread_id,
@@ -238,5 +251,73 @@ impl ThreadStore {
             _ => {}
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(store: &ThreadStore, ty: &str, thread: &str) {
+        store.apply(&json!({
+            "type": ty, "thread_id": thread, "turn_id": "turn",
+            "message": "failure", "text": "hello", "ts": u64::MAX,
+        }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn error_expression_expires_but_diagnostic_state_remains() {
+        let store = ThreadStore::new();
+        event(&store, "agent.error", "failed");
+        assert_eq!(store.aggregate_state(), "error");
+        tokio::time::advance(Duration::from_millis(29_999)).await;
+        assert_eq!(store.aggregate_state(), "error");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(store.aggregate_state(), "idle");
+        assert_eq!(store.snapshot()[0]["state"], "error");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_conversations_take_priority_over_errors() {
+        let store = ThreadStore::new();
+        event(&store, "agent.error", "failed");
+        event(&store, "turn.started", "active");
+        assert_eq!(store.aggregate_state(), "thinking");
+        event(&store, "message.delta", "active");
+        assert_eq!(store.aggregate_state(), "talking");
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(store.aggregate_state(), "talking");
+        event(&store, "turn.complete", "active");
+        assert_eq!(store.aggregate_state(), "idle");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn new_error_gets_its_own_deadline() {
+        let store = ThreadStore::new();
+        event(&store, "agent.error", "first");
+        tokio::time::advance(Duration::from_secs(20)).await;
+        event(&store, "agent.error", "second");
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(store.aggregate_state(), "error");
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert_eq!(store.aggregate_state(), "idle");
+        event(&store, "agent.error", "first");
+        assert_eq!(store.aggregate_state(), "error");
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(store.aggregate_state(), "idle");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovered_thread_does_not_return_to_error() {
+        for terminal in ["turn.complete", "turn.aborted"] {
+            let store = ThreadStore::new();
+            event(&store, "agent.error", "same");
+            event(&store, "turn.started", "same");
+            assert_eq!(store.aggregate_state(), "thinking");
+            event(&store, terminal, "same");
+            assert_eq!(store.aggregate_state(), "idle");
+            tokio::time::advance(Duration::from_secs(31)).await;
+            assert_eq!(store.aggregate_state(), "idle");
+        }
     }
 }
