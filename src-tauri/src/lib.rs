@@ -1,6 +1,6 @@
 use fs2::FileExt;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -17,9 +17,18 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, Wry};
 #[cfg(target_os = "macos")]
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
+use xangi_events_server::agents::{self, AgentPet, AgentRouter};
+use xangi_events_server::instances::{enabled_instances, InstanceSpec};
+use xangi_events_server::pet_inbox::create_agent_pet_session;
+use xangi_events_server::session_filters::{self, SessionSource};
+use xangi_events_server::session_monitor::SessionPet;
+use xangi_events_server::session_monitor::{spawn_session_monitor, SessionMonitorHandle};
+use xangi_events_server::sse_client::spawn_agent_pull_client;
+mod display_settings;
+mod session_windows;
+use session_windows::{SessionContext, SessionWindows};
 use xangi_events_server::{
-    create_pet_session, make_state_with_extra_pet_dirs, post_pet_message,
-    spawn_pull_client_with_callbacks, AppState, PetInboxError, PullClientHandle,
+    make_state_with_extra_pet_dirs, post_pet_message, AppState, PetInboxError, PullClientHandle,
     PullConnectionState,
 };
 
@@ -40,6 +49,11 @@ struct PullState {
     app_handle: AppHandle,
     handle: Mutex<Option<PullClientHandle>>,
     current_url: Mutex<Option<String>>,
+    current_agent: Mutex<Option<String>>,
+    session_monitors: Mutex<BTreeMap<String, (InstanceSpec, SessionMonitorHandle)>>,
+    session_windows: Arc<SessionWindows>,
+    session_filters: tokio::sync::watch::Sender<Vec<SessionSource>>,
+    send_lock: tokio::sync::Mutex<()>,
     pet_session_id: Mutex<Option<String>>,
     connection: Mutex<AppConnectionState>,
     notifications_enabled: AtomicBool,
@@ -125,6 +139,7 @@ pub fn run() {
 
     builder
         .setup(|app| {
+            display_settings::initialize(app.handle());
             // Build a minimal macOS menu bar: App menu (About / Preferences /
             // Quit) + Help menu (Show Help). On Linux/Windows it shows up as
             // a regular menu bar; the pet window itself is decoration-less so
@@ -183,11 +198,19 @@ pub fn run() {
             // Stash the bus-bearing state so the Tauri commands below can
             // reach it (set_xangi_url restarts the pull client by handing
             // this state to spawn_pull_client again).
+            let filter_path = app.path().app_config_dir()?.join("session-filters.json");
+            let (session_filters, _) =
+                tokio::sync::watch::channel(session_filters::load(&filter_path));
             let pull_state = Arc::new(PullState {
                 app: state.clone(),
                 app_handle: app.handle().clone(),
                 handle: Mutex::new(None),
                 current_url: Mutex::new(None),
+                current_agent: Mutex::new(None),
+                session_monitors: Mutex::new(BTreeMap::new()),
+                session_filters,
+                session_windows: Arc::new(SessionWindows::new(app.handle().clone())),
+                send_lock: tokio::sync::Mutex::new(()),
                 pet_session_id: Mutex::new(None),
                 connection: Mutex::new(AppConnectionState::NotConfigured),
                 notifications_enabled: AtomicBool::new(false),
@@ -247,7 +270,8 @@ pub fn run() {
                     Ok(url) => {
                         let pull_state = pull_state.clone();
                         tauri::async_runtime::spawn(async move {
-                            start_pull_client(&pull_state, url);
+                            let _send_guard = pull_state.send_lock.lock().await;
+                            start_pull_client(&pull_state, url).await;
                         });
                     }
                     Err(err) => {
@@ -262,7 +286,19 @@ pub fn run() {
             set_bubble_active,
             get_server_url,
             set_pet_size,
+            get_pet_display,
+            set_pet_scale,
+            cycle_pet_scale,
             set_xangi_url,
+            list_xangi_agents,
+            get_agent_pet,
+            sync_enabled_instances,
+            get_session_filters,
+            set_session_filters,
+            hide_inactive_pet,
+            get_session_pet_context,
+            get_session_pet_asset,
+            session_pet_ready,
             get_xangi_url,
             get_connection_profiles,
             upsert_connection_profile,
@@ -324,11 +360,84 @@ fn set_pet_size(w: i32, h: i32) {
 /// on a worker thread without a Tokio runtime context. async commands run
 /// inside `tauri::async_runtime` (which IS Tokio), so the inner spawn works.
 #[tauri::command]
-async fn set_xangi_url(url: String) -> Result<String, String> {
+async fn set_xangi_url(url: String, agent_id: Option<String>) -> Result<String, String> {
     let trimmed = normalize_xangi_url(&url)?;
     let pull_state = PULL_STATE.get().ok_or("pull state not initialised")?;
-    start_pull_client(pull_state, trimmed.clone());
+    let agent_id = agent_id.filter(|id| !id.trim().is_empty());
+    if let Some(id) = &agent_id {
+        agents::require_agent(&trimmed, id).await?;
+    }
+    let _send_guard = pull_state.send_lock.lock().await;
+    *pull_state.current_agent.lock().map_err(|e| e.to_string())? = agent_id;
+    start_pull_client(pull_state, trimmed.clone()).await;
     Ok(trimmed)
+}
+
+#[tauri::command]
+async fn list_xangi_agents(url: String) -> Result<Value, String> {
+    agents::list_agents(&normalize_xangi_url(&url)?).await
+}
+
+#[tauri::command]
+async fn get_agent_pet(directory: String) -> Result<AgentPet, String> {
+    let state = PULL_STATE.get().ok_or("pull state not initialised")?;
+    let base = state
+        .current_url
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or("接続先未設定")?;
+    let agent = state
+        .current_agent
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .unwrap_or_else(|| "xangi:default".into());
+    agents::load_agent_pet(&base, &agent, &directory).await
+}
+
+#[tauri::command]
+fn get_pet_display() -> display_settings::PetDisplay {
+    display_settings::get()
+}
+
+#[tauri::command]
+fn set_pet_scale(app: AppHandle, scale: f64) -> Result<display_settings::PetDisplay, String> {
+    display_settings::update(&app, Some(scale))
+}
+
+#[tauri::command]
+fn cycle_pet_scale(app: AppHandle) -> Result<display_settings::PetDisplay, String> {
+    display_settings::update(&app, None)
+}
+
+#[tauri::command]
+fn get_session_pet_context(window: tauri::WebviewWindow) -> Result<SessionContext, String> {
+    PULL_STATE
+        .get()
+        .ok_or("pull state not initialised")?
+        .session_windows
+        .context(window.label())
+}
+
+#[tauri::command]
+async fn get_session_pet_asset(window: tauri::WebviewWindow) -> Result<AgentPet, String> {
+    PULL_STATE
+        .get()
+        .ok_or("pull state not initialised")?
+        .session_windows
+        .sprite(window.label())
+        .await
+}
+
+#[tauri::command]
+fn session_pet_ready(window: tauri::WebviewWindow) -> Result<(), String> {
+    // A caller outside this registry cannot show an arbitrary window.
+    PULL_STATE
+        .get()
+        .ok_or("pull state not initialised")?
+        .session_windows
+        .ready(&window)
 }
 
 /// Returns the xangi URL the pull client is currently subscribed to, or
@@ -471,6 +580,12 @@ mod connection_profile_tests {
 #[tauri::command]
 async fn send_pet_message(text: String) -> Result<String, String> {
     let pull_state = PULL_STATE.get().ok_or("pull state not initialised")?;
+    let _send_guard = pull_state.send_lock.lock().await;
+    let agent_id = pull_state
+        .current_agent
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
     let base_url = pull_state
         .current_url
         .lock()
@@ -479,6 +594,9 @@ async fn send_pet_message(text: String) -> Result<String, String> {
         .ok_or("xangi URL not set — open the URL prompt with `x` first")?;
     let token = std::env::var("XANGI_PET_INBOX_TOKEN").ok();
     let token_ref = token.as_deref().filter(|s| !s.is_empty());
+    if let Some(id) = &agent_id {
+        agents::require_agent(&base_url, id).await?;
+    }
     let session_id = pull_state
         .pet_session_id
         .lock()
@@ -487,7 +605,7 @@ async fn send_pet_message(text: String) -> Result<String, String> {
     let session_id = match session_id {
         Some(session_id) => session_id,
         None => {
-            let session_id = create_pet_session(&base_url, token_ref)
+            let session_id = create_agent_pet_session(&base_url, token_ref, agent_id.as_deref())
                 .await
                 .map_err(|e| e.to_string())?;
             if let Ok(mut current) = pull_state.pet_session_id.lock() {
@@ -501,7 +619,10 @@ async fn send_pet_message(text: String) -> Result<String, String> {
         Err(PetInboxError::Rejected { status: 404, .. }) => {
             // xangi may have restarted and forgotten an in-memory session.
             // Create one replacement and retry this message exactly once.
-            let replacement = create_pet_session(&base_url, token_ref)
+            if let Some(id) = &agent_id {
+                agents::require_agent(&base_url, id).await?;
+            }
+            let replacement = create_agent_pet_session(&base_url, token_ref, agent_id.as_deref())
                 .await
                 .map_err(|e| e.to_string())?;
             if let Ok(mut current) = pull_state.pet_session_id.lock() {
@@ -519,23 +640,34 @@ async fn send_pet_message(text: String) -> Result<String, String> {
 /// Stop the pull client and forget the configured URL. Used when the
 /// frontend wants to show the onboarding screen again.
 #[tauri::command]
-fn clear_xangi_url() {
+async fn clear_xangi_url() {
     if let Some(pull_state) = PULL_STATE.get() {
+        let _send_guard = pull_state.send_lock.lock().await;
         pull_state.generation.fetch_add(1, Ordering::Relaxed);
         set_connection_state(pull_state, AppConnectionState::NotConfigured);
-        // Cancel the running task without blocking the command. The async
-        // shutdown will run on the tokio pool.
-        let pull_state = pull_state.clone();
-        tauri::async_runtime::spawn(async move {
-            stop_pull_client(&pull_state).await;
-            if let Ok(mut url) = pull_state.current_url.lock() {
-                *url = None;
-            }
-            if let Ok(mut session_id) = pull_state.pet_session_id.lock() {
-                *session_id = None;
-            }
-            refresh_tray(&pull_state.app_handle);
-        });
+        stop_pull_client(pull_state).await;
+        if let Ok(mut url) = pull_state.current_url.lock() {
+            *url = None;
+        }
+        if let Ok(mut session_id) = pull_state.pet_session_id.lock() {
+            *session_id = None;
+        }
+        if let Ok(mut agent) = pull_state.current_agent.lock() {
+            *agent = None;
+        }
+        pull_state.app.store.clear();
+        let _ = pull_state
+            .app
+            .state_bus
+            .send(serde_json::json!({"state":"idle"}));
+        let _ = pull_state
+            .app
+            .bubble_bus
+            .send(serde_json::json!({"type":"bubble.reset"}));
+        if let Err(error) = reconcile_instances(pull_state).await {
+            eprintln!("xangi-pets: instance sync failed: {error}");
+        }
+        refresh_tray(&pull_state.app_handle);
     }
 }
 
@@ -609,10 +741,9 @@ fn open_web_chat(app: AppHandle) -> Result<(), String> {
 }
 
 /// Append `/api/events/stream` to a base URL and start (or restart) the
-/// pull client. Synchronous: the actual stream-reading runs on a tokio
-/// task, but we replace the handle synchronously so subsequent calls see
-/// the new handle.
-fn start_pull_client(pull_state: &Arc<PullState>, base_url: String) {
+/// pull client. Wait for the old reader to exit before clearing its state,
+/// so a late event cannot enter the next connection's store.
+async fn start_pull_client(pull_state: &Arc<PullState>, base_url: String) {
     let stream_url = format!("{base_url}/api/events/stream");
     println!("xangi-events pull: subscribing to {stream_url}");
     let generation = pull_state.generation.fetch_add(1, Ordering::Relaxed) + 1;
@@ -624,13 +755,18 @@ fn start_pull_client(pull_state: &Arc<PullState>, base_url: String) {
     // Stop the previous client (if any) before starting a new one.
     let prev_handle = pull_state.handle.lock().ok().and_then(|mut g| g.take());
     if let Some(prev) = prev_handle {
-        let pull_state = pull_state.clone();
-        tauri::async_runtime::spawn(async move {
-            prev.shutdown().await;
-            // Drop only happens after shutdown returns.
-            drop(pull_state);
-        });
+        prev.shutdown().await;
     }
+
+    pull_state.app.store.clear();
+    let _ = pull_state
+        .app
+        .state_bus
+        .send(serde_json::json!({"state":"idle"}));
+    let _ = pull_state
+        .app
+        .bubble_bus
+        .send(serde_json::json!({"type":"bubble.reset"}));
 
     let state_for_connection = pull_state.clone();
     let on_connection = Arc::new(move |connection: PullConnectionState| {
@@ -651,19 +787,193 @@ fn start_pull_client(pull_state: &Arc<PullState>, base_url: String) {
             handle_notification_event(&state_for_events, event);
         }
     });
-    let new_handle = spawn_pull_client_with_callbacks(
+    let agent = pull_state
+        .current_agent
+        .lock()
+        .ok()
+        .and_then(|id| id.clone());
+    let agent = Some(AgentRouter::with_filters(
+        base_url.clone(),
+        agent,
+        pull_state.session_filters.subscribe(),
+    ));
+    let new_handle = spawn_agent_pull_client(
         pull_state.app.clone(),
         stream_url,
         on_connection,
         on_event,
+        agent,
     );
     if let Ok(mut g) = pull_state.handle.lock() {
         *g = Some(new_handle);
     }
     if let Ok(mut g) = pull_state.current_url.lock() {
-        *g = Some(base_url);
+        *g = Some(base_url.clone());
+    }
+    if let Err(error) = reconcile_instances(pull_state).await {
+        eprintln!("xangi-pets: instance sync failed: {error}");
     }
     refresh_tray(&pull_state.app_handle);
+}
+
+#[tauri::command]
+fn get_session_filters() -> Result<Vec<SessionSource>, String> {
+    let state = PULL_STATE.get().ok_or("pull state not initialised")?;
+    Ok(state.session_filters.borrow().clone())
+}
+
+#[tauri::command]
+async fn set_session_filters(filters: Vec<SessionSource>) -> Result<Vec<SessionSource>, String> {
+    let state = PULL_STATE.get().ok_or("pull state not initialised")?;
+    let _guard = state.send_lock.lock().await;
+    let path = state
+        .app_handle
+        .path()
+        .app_config_dir()
+        .map_err(|e| e.to_string())?
+        .join("session-filters.json");
+    session_filters::save(&path, &filters).map_err(|e| e.to_string())?;
+    state.session_filters.send_replace(filters.clone());
+    // Existing responses may belong to a source that was just hidden.
+    state.app.store.clear();
+    let _ = state
+        .app
+        .bubble_bus
+        .send(serde_json::json!({"type":"bubble.reset"}));
+    let _ = state
+        .app
+        .state_bus
+        .send(serde_json::json!({"state":"idle"}));
+    Ok(filters)
+}
+
+#[tauri::command]
+async fn sync_enabled_instances() -> Result<Option<String>, String> {
+    let state = PULL_STATE.get().ok_or("pull state not initialised")?;
+    let _guard = state.send_lock.lock().await;
+    reconcile_instances(state).await?;
+    Ok(get_xangi_url())
+}
+
+#[tauri::command]
+fn hide_inactive_pet(window: tauri::WebviewWindow) -> Result<(), String> {
+    if window.label() == "pet" && get_xangi_url().is_none() {
+        window.hide().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+async fn reconcile_instances(state: &Arc<PullState>) -> Result<(), String> {
+    let profiles = get_connection_profiles(state.app_handle.clone())?;
+    let primary = get_xangi_url();
+    let agent = state.current_agent.lock().unwrap().clone();
+    let mut desired = enabled_instances(
+        &profiles,
+        primary.as_deref().map(|url| (url, agent.as_deref())),
+    );
+    if let Some(url) = &primary {
+        if !desired.contains_key(url) {
+            state.generation.fetch_add(1, Ordering::Relaxed);
+            stop_pull_client(state).await;
+            *state.current_url.lock().unwrap() = None;
+            *state.pet_session_id.lock().unwrap() = None;
+            *state.current_agent.lock().unwrap() = None;
+            state.app.store.clear();
+            let _ = state
+                .app
+                .bubble_bus
+                .send(serde_json::json!({"type":"bubble.reset"}));
+            let _ = state
+                .app
+                .state_bus
+                .send(serde_json::json!({"state":"idle"}));
+            set_connection_state(state, AppConnectionState::NotConfigured);
+            desired = enabled_instances(&profiles, None);
+        }
+    }
+    // Take the map before awaiting shutdown; only changed sources are restarted.
+    let previous = std::mem::take(&mut *state.session_monitors.lock().unwrap());
+    let mut retained = BTreeMap::new();
+    for (url, (spec, handle)) in previous {
+        if desired.get(&url) == Some(&spec) {
+            retained.insert(url, (spec, handle));
+        } else {
+            handle.shutdown().await;
+            state.session_windows.clear_source(&url);
+        }
+    }
+    for (url, spec) in desired {
+        if retained.contains_key(&url) {
+            continue;
+        }
+        let windows = state.session_windows.clone();
+        let captured = spec.clone();
+        windows.reconcile(
+            &url,
+            &spec.directories,
+            &spec.name,
+            instance_pets(&spec, Vec::new(), false),
+        );
+        let handle = spawn_session_monitor(
+            &url,
+            state.session_filters.subscribe(),
+            Arc::new(move |sessions| {
+                windows.reconcile(
+                    &captured.url,
+                    &captured.directories,
+                    &captured.name,
+                    instance_pets(&captured, sessions, true),
+                );
+            }),
+        );
+        retained.insert(url, (spec, handle));
+    }
+    *state.session_monitors.lock().unwrap() = retained;
+    Ok(())
+}
+
+fn instance_pets(
+    spec: &InstanceSpec,
+    mut sessions: Vec<SessionPet>,
+    connected: bool,
+) -> Vec<SessionPet> {
+    if !spec.primary {
+        let state = if !connected {
+            "idle"
+        } else if sessions.iter().any(|s| s.state == "talking") {
+            "talking"
+        } else if !sessions.is_empty() {
+            "thinking"
+        } else {
+            "idle"
+        };
+        let agent_name = sessions
+            .iter()
+            .find(|pet| pet.agent_id == spec.agent_id)
+            .map(|pet| pet.agent_name.clone())
+            .unwrap_or_else(|| {
+                if spec.agent_id == "xangi:default" {
+                    "デフォルトAgent".into()
+                } else {
+                    "Agent".into()
+                }
+            });
+        sessions.push(SessionPet {
+            persistent: true,
+            session_id: String::new(),
+            agent_id: spec.agent_id.clone(),
+            agent_name,
+            title: "常駐ペット".into(),
+            state: state.into(),
+            summary: if connected {
+                "待機・実行状況を表示"
+            } else {
+                "接続中"
+            }
+            .into(),
+        });
+    }
+    sessions
 }
 
 async fn stop_pull_client(pull_state: &Arc<PullState>) {
@@ -925,6 +1235,9 @@ fn handle_control_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         "tray_show" | "menu_show" => show_pet_window(app),
         "tray_recenter" | "menu_recenter" => recenter_pet_window(app),
         "tray_hide" | "menu_hide" => {
+            if let Some(state) = PULL_STATE.get() {
+                state.session_windows.set_visible(false);
+            }
             if let Some(window) = app.get_webview_window("pet") {
                 let _ = window.hide();
             }
@@ -978,6 +1291,9 @@ fn handle_control_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
 }
 
 fn show_pet_window(app: &AppHandle) {
+    if let Some(state) = PULL_STATE.get() {
+        state.session_windows.set_visible(true);
+    }
     if let Some(window) = app.get_webview_window("pet") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -986,6 +1302,9 @@ fn show_pet_window(app: &AppHandle) {
 }
 
 fn recenter_pet_window(app: &AppHandle) {
+    if let Some(state) = PULL_STATE.get() {
+        state.session_windows.set_visible(true);
+    }
     if let Some(window) = app.get_webview_window("pet") {
         let _ = window.center();
         let _ = window.show();

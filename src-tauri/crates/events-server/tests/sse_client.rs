@@ -26,6 +26,34 @@ use serde_json::json;
 use xangi_events_server::{
     make_state, spawn_pull_client, spawn_pull_client_with_callbacks, PullConnectionState,
 };
+use xangi_events_server::agents::AgentRouter;
+use xangi_events_server::sse_client::spawn_agent_pull_client;
+
+#[tokio::test]
+async fn agent_filter_precedes_bubbles_state_and_notification_callbacks() {
+    let frames = vec![
+        json!({"type":"turn.started","thread_id":"web:b","turn_id":"b1","agent_id":"b"}),
+        json!({"type":"turn.started","thread_id":"web:a","turn_id":"a1","agent_id":"a"}),
+        json!({"type":"turn.complete","thread_id":"web:b","turn_id":"b1","agent_id":"b","text":"other"}),
+        json!({"type":"turn.complete","thread_id":"web:a","turn_id":"a1","agent_id":"a","text":"mine"}),
+    ].into_iter().map(|event| SseFrame { event_type: None, data: event.to_string() }).collect();
+    let addr = spawn_fake_xangi(frames).await;
+    let base = format!("http://{addr}");
+    let state = make_state();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let collected = events.clone();
+    let handle = spawn_agent_pull_client(state.clone(), format!("{base}/api/events/stream"), Arc::new(|_| {}),
+        Arc::new(move |event| collected.lock().unwrap().push(event.clone())),
+        Some(AgentRouter::new(base, "a".into())));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while events.lock().unwrap().len() < 2 { tokio::time::sleep(Duration::from_millis(10)).await; }
+    }).await.unwrap();
+    handle.shutdown().await;
+    assert_eq!(state.store.snapshot().len(), 1);
+    assert_eq!(state.store.snapshot()[0]["thread_id"], "web:a");
+    assert!(events.lock().unwrap().iter().all(|event| event["agent_id"] == "a"));
+    assert_eq!(state.store.aggregate_state(), "idle");
+}
 
 #[derive(Clone)]
 struct SseFrame {

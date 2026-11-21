@@ -404,6 +404,12 @@ export function makeBubbleUI({
       return;
     }
     switch (ev.type) {
+      case 'bubble.reset': {
+        for (const bubble of [...bubbles]) removeBubble(bubble);
+        dismissedTurnIds.clear();
+        clearPreview();
+        break;
+      }
       case 'bubble.snapshot': {
         if (!showNormalResponses) break;
         // A bubble that was already open before we connected. Treat it like

@@ -526,3 +526,49 @@ async fn aggregate_state_derives_from_turn_lifecycle() {
         .unwrap();
     assert_eq!(health["aggregateState"], "idle");
 }
+
+#[tokio::test]
+async fn error_expression_recovers_over_http_without_new_events() {
+    let (addr, state) = spawn_server().await;
+    http_server::process_event(
+        &state,
+        json!({
+            "type": "agent.error", "thread_id": "failed", "turn_id": "turn",
+            "message": "failure",
+        }),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let client = reqwest::Client::new();
+    let mut stream =
+        reqwest_eventsource::EventSource::new(client.get(format!("http://{addr}/api/pet/state")))
+            .unwrap();
+    let states = tokio::time::timeout(Duration::from_secs(35), async {
+        let mut states = Vec::new();
+        while let Some(event) = stream.next().await {
+            if let reqwest_eventsource::Event::Message(message) = event.unwrap() {
+                let payload: Value = serde_json::from_str(&message.data).unwrap();
+                states.push(payload["state"].as_str().unwrap().to_string());
+                if states.len() == 2 {
+                    break;
+                }
+            }
+        }
+        states
+    })
+    .await
+    .expect("SSE must recover without a new event");
+    assert_eq!(states, ["error", "idle"]);
+    assert!(started.elapsed() >= Duration::from_secs(30));
+    let health: Value = client
+        .get(format!("http://{addr}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["aggregateState"], "idle");
+    assert_eq!(health["threads"][0]["state"], "error");
+    stream.close();
+}

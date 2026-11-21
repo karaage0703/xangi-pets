@@ -51,7 +51,7 @@ pub struct PullClientHandle {
 impl PullClientHandle {
     /// Stop the pull client and wait for the task to complete.
     pub async fn shutdown(&self) {
-        self.cancel.notify_waiters();
+        self.cancel.notify_one();
         let task = self.task.lock().ok().and_then(|mut g| g.take());
         if let Some(task) = task {
             let _ = task.await;
@@ -79,6 +79,16 @@ pub fn spawn_pull_client_with_callbacks(
     on_connection: ConnectionCallback,
     on_event: EventCallback,
 ) -> PullClientHandle {
+    spawn_agent_pull_client(state, xangi_url, on_connection, on_event, None)
+}
+
+pub fn spawn_agent_pull_client(
+    state: AppState,
+    xangi_url: String,
+    on_connection: ConnectionCallback,
+    on_event: EventCallback,
+    agent: Option<crate::agents::AgentRouter>,
+) -> PullClientHandle {
     let cancel = Arc::new(Notify::new());
     let cancel_for_task = cancel.clone();
     let task = tokio::spawn(async move {
@@ -88,6 +98,7 @@ pub fn spawn_pull_client_with_callbacks(
             cancel_for_task,
             on_connection,
             on_event,
+            agent,
         )
         .await;
     });
@@ -103,6 +114,7 @@ async fn run(
     cancel: Arc<Notify>,
     on_connection: ConnectionCallback,
     on_event: EventCallback,
+    mut agent: Option<crate::agents::AgentRouter>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     on_connection(PullConnectionState::Connecting);
@@ -114,6 +126,7 @@ async fn run(
                 &xangi_url,
                 on_connection.clone(),
                 on_event.clone(),
+                &mut agent,
             ) => {
                 match outcome {
                     Ok(()) => {
@@ -154,6 +167,7 @@ async fn run_once(
     xangi_url: &str,
     on_connection: ConnectionCallback,
     on_event: EventCallback,
+    agent: &mut Option<crate::agents::AgentRouter>,
 ) -> Result<(), String> {
     let mut es = EventSource::get(xangi_url);
     while let Some(ev) = es.next().await {
@@ -177,6 +191,17 @@ async fn run_once(
                         continue;
                     }
                 };
+                if let Some(router) = agent.as_mut() {
+                    if crate::events::validate(&raw).is_err() { continue; }
+                    match router.accepts(&raw).await {
+                        Ok(true) => {},
+                        Ok(false) => continue,
+                        Err(err) => {
+                            eprintln!("xangi-events: Agent routing failed; event skipped: {err}");
+                            continue;
+                        }
+                    }
+                }
                 if let Err(err) = process_event(state, raw.clone()) {
                     // Validation rejection — log and keep going. We don't
                     // want one bad event to kill the whole stream.

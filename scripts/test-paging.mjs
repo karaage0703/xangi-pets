@@ -385,6 +385,12 @@ async function run() {
   });
   assert(completionRoot.children.length === 0, 'completion toggle: new finals stay hidden');
 
+  completionUi.setDisplayPreferences({ normalResponses: true, completions: true });
+  completionUi.handle({ type: 'bubble.open', thread_id: 'old', turn_id: 'old-turn' });
+  assert(completionRoot.children.length === 1, 'reset setup: old connection bubble exists');
+  completionUi.handle({ type: 'bubble.reset' });
+  assert(completionRoot.children.length === 0, 'reset: previous connection bubbles are cleared');
+
   console.log('\nall paging tests passed.');
 }
 

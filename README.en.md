@@ -10,15 +10,12 @@ A desktop companion for [xangi](https://github.com/karaage0703/xangi). It animat
 
 ## Key features
 
-- Animate with xangi's `idle`, `thinking`, `talking`, and `error` states
-- Show concurrent conversations in speech bubbles and page through long responses
-- Send a message to xangi by clicking the pet or pressing `t`
-- Control visibility, connections, and notifications from the menu bar or application menu
-- Open xangi Web Chat inside the app or in the default browser
-- Toggle live responses, completion messages, and macOS system notifications independently
-- Scale the pet and speech bubble through five sizes each
-- Use multiple xangi connections and multiple pet processes
-- Load Codex `hatch-pet` compatible sprites or the bundled `xangi` pet
+- Animate with xangi's activity and show responses in speech bubbles
+- Click the pet or press `t` to send messages, or open Web Chat
+- Watch multiple xangi instances and automatically show each running session's agent
+- Choose which session types to display: Chat, Web, and Automation
+- Load `hatch-pet` compatible artwork from agent workspaces, with bundled `xangi` as fallback
+- Adjust pet and bubble sizes, response display, and macOS notifications
 
 ## Quickstart
 
@@ -36,17 +33,9 @@ See [Installation](docs/INSTALL.md) for first-launch details and the [Usage Guid
 
 Click the pet or press `t` to send a message to xangi. Drag the pet to reposition it.
 
-The app stays available in the menu bar and provides these actions:
+Use the menu bar or application menu to control visibility, connections, notifications, and sizes. If the pet moves off-screen, choose **Return Pet to Center**.
 
-- Show or hide the pet
-- Return the pet to the center of the display
-- Talk to xangi
-- Open Web Chat in the app or browser
-- Add, select, or edit a connection
-- Toggle speech bubbles and system notifications
-- Change the pet and bubble sizes
-
-If automatic wandering, manual placement, or a monitor-layout change carries the pet off-screen, choose **Return Pet to Center** from the menu bar or application menu.
+Choose types under **表示するセッション** (Session types) in the connection screen. Chat and Web are on by default; Automation is off. The setting applies to all connections, while permanent pets stay visible. See [Session pets](docs/en/usage.md#session-pets).
 
 See the [Usage Guide](docs/en/usage.md) for keyboard controls, multiple instances, custom pets, and troubleshooting.
 

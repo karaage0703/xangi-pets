@@ -1,3 +1,37 @@
+.session-pet #stage {
+  visibility: hidden;
+  width: 180px;
+  padding: 0;
+}
+
+.session-pet.pet-ready #stage {
+  visibility: visible;
+}
+
+.session-pet-label {
+  box-sizing: border-box;
+  max-width: 180px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.95);
+  color: #242424;
+  font: 11px/1.3 -apple-system, BlinkMacSystemFont, sans-serif;
+  text-align: center;
+}
+
+.session-pet-label strong,
+.session-pet-label span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-pet-status {
+  color: #555;
+  font-size: 10px;
+}
+
 html,
 body {
   margin: 0;
@@ -143,9 +177,8 @@ canvas#pet {
   display: none; /* WebKit / Chromium */
 }
 
-/* ---------- Picker overlays (pet + instance) ---------- */
+/* ---------- Connection picker overlay ---------- */
 
-#pet-picker,
 #instance-picker {
   position: fixed;
   inset: 0;
@@ -451,6 +484,11 @@ canvas#pet {
   margin-bottom: 10px;
 }
 
+.instance-switches { border: 1px solid #ccc; border-radius: 6px; margin: 6px 0; padding: 6px 8px; max-height: 140px; overflow-y: auto; font-size: 11px; }
+.instance-switches small { display: block; overflow-wrap: anywhere; color: #666; }
+.session-filter-switches { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.session-filter-switches input:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+
 .connection-profile-list .new-profile {
   border-style: dashed;
   color: #245f9e;
@@ -469,6 +507,8 @@ canvas#pet {
 }
 
 .xangi-profile-name,
+.xangi-agent-select,
+.xangi-sprite-directory,
 .xangi-url-card .xangi-url-input {
   width: 100%;
   box-sizing: border-box;
@@ -488,6 +528,8 @@ canvas#pet {
   height: 16px;
 }
 
+.xangi-agent-select,
+.xangi-sprite-directory,
 .xangi-url-card .xangi-url-input {
   width: 100%;
   box-sizing: border-box;
@@ -501,6 +543,8 @@ canvas#pet {
   color: #1a1a1a;
 }
 
+.xangi-agent-select:focus,
+.xangi-sprite-directory:focus,
 .xangi-url-card .xangi-url-input:focus {
   outline: none;
   border-color: #7ab3f5;
