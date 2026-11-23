@@ -1,6 +1,6 @@
 {
   "name": "xangi-pets",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Desktop floating pets for xangi (Codex hatch-pet sprite compatible)",
   "type": "module",
   "private": true,
@@ -18,6 +18,6 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.1.0",
-    "vite": "^6.4.4"
+    "vite": "^6.4.6"
   }
 }
